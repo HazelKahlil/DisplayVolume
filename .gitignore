@@ -1,0 +1,22 @@
+# Build outputs & binaries
+build/
+dist/
+*.dmg
+*.zip
+*.app/
+*.o
+*.dSYM/
+
+# SwiftPM / Xcode
+.build/
+.swiftpm/
+*.xcodeproj
+*.xcworkspace
+DerivedData/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*

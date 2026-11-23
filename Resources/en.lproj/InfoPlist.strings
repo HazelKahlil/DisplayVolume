@@ -1,0 +1,3 @@
+"CFBundleName" = "DisplayVolume";
+"CFBundleDisplayName" = "DisplayVolume";
+"NSAudioCaptureUsageDescription" = "DisplayVolume processes local playback audio before sending it to external DisplayPort or HDMI speakers so you can adjust volume from macOS and your keyboard. Audio stays on your Mac and is never recorded or uploaded.";

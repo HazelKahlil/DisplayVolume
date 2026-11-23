@@ -1,0 +1,3 @@
+"CFBundleName" = "桌面音量后台";
+"CFBundleDisplayName" = "桌面音量后台";
+"NSAudioCaptureUsageDescription" = "桌面音量后台需要在声音送往外接显示器之前实时调节电平，以支持关闭菜单栏界面后依然持久控音。音频仅在本机实时处理，绝不录音、保存或上传。";

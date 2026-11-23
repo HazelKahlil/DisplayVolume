@@ -1,0 +1,52 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <filter id="dockShadow" x="36" y="48" width="952" height="952" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="20" stdDeviation="18" flood-color="#020612" flood-opacity="0.42"/>
+    </filter>
+    <linearGradient id="baseBg" x1="200" y1="100" x2="824" y2="924" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#2D333E"/>
+      <stop offset="50%" stop-color="#181C24"/>
+      <stop offset="100%" stop-color="#0C0F14"/>
+    </linearGradient>
+    <radialGradient id="topFresnel" cx="310" cy="174" r="620" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.14"/>
+      <stop offset="52%" stop-color="#94A3B8" stop-opacity="0.04"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="speakerGrad" x1="302" y1="346" x2="502" y2="626" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="55%" stop-color="#E2E8F0"/>
+      <stop offset="100%" stop-color="#94A3B8"/>
+    </linearGradient>
+    <linearGradient id="barFill" x1="280" y1="681" x2="614" y2="681" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38BDF8"/>
+      <stop offset="60%" stop-color="#BAE6FD"/>
+      <stop offset="100%" stop-color="#FFFFFF"/>
+    </linearGradient>
+    <linearGradient id="rimBevel" x1="120" y1="100" x2="904" y2="924" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.56"/>
+      <stop offset="35%" stop-color="#CBD5E1" stop-opacity="0.18"/>
+      <stop offset="70%" stop-color="#64748B" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#E2E8F0" stop-opacity="0.36"/>
+    </linearGradient>
+  </defs>
+  <g filter="url(#dockShadow)">
+    <rect x="100" y="100" width="824" height="824" rx="185.4" fill="url(#baseBg)"/>
+  </g>
+  <rect x="100" y="100" width="824" height="824" rx="185.4" fill="url(#topFresnel)"/>
+  <!-- Display Bezel & Stand -->
+  <rect x="192" y="278" width="640" height="472" rx="52" fill="#0A0D12" fill-opacity="0.48" stroke="#E2E8F0" stroke-opacity="0.22" stroke-width="7"/>
+  <rect x="478" y="750" width="68" height="70" rx="10" fill="#94A3B8" fill-opacity="0.34"/>
+  <rect x="386" y="818" width="252" height="22" rx="11" fill="#94A3B8" fill-opacity="0.34"/>
+  <!-- Speaker Cone -->
+  <path d="M 316 440 H 388 L 488 352 C 494 348 498 352 498 360 V 612 C 498 620 494 624 488 620 L 388 532 H 316 C 306 532 302 526 302 518 V 454 C 302 446 306 440 316 440 Z" fill="url(#speakerGrad)"/>
+  <!-- Sound Wave Arcs -->
+  <path d="M 568 441 A 72 72 0 0 1 568 531" stroke="#F8FAFC" stroke-opacity="0.96" stroke-width="26" stroke-linecap="round"/>
+  <path d="M 616 402 A 134 134 0 0 1 616 570" stroke="#7DD3FC" stroke-opacity="0.84" stroke-width="26" stroke-linecap="round"/>
+  <path d="M 664 363 A 196 196 0 0 1 664 609" stroke="#7DD3FC" stroke-opacity="0.62" stroke-width="26" stroke-linecap="round"/>
+  <!-- Volume Bar -->
+  <rect x="280" y="664" width="464" height="34" rx="17" fill="#FFFFFF" fill-opacity="0.14"/>
+  <rect x="280" y="664" width="334" height="34" rx="17" fill="url(#barFill)"/>
+  <!-- Outer Rim Bevel -->
+  <rect x="102" y="102" width="820" height="820" rx="183.4" stroke="url(#rimBevel)" stroke-width="4.5"/>
+</svg>
