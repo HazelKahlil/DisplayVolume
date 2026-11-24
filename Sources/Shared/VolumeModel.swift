@@ -68,6 +68,8 @@ enum VolumeCommand: String {
     case setShowMenuBarPercent
     case setScrollOnIcon
     case setUIMediaKeysActive
+    case toggleMicMute
+    case showMicOSD
     case reverifyCapture
     case shutdownEngine
 }
@@ -163,5 +165,24 @@ enum VolumeMath {
             return (next, false)
         }
         return (min(safeLimit, currentVolume), muted)
+    }
+}
+
+/// Pure soft-mute math for microphones without hardware kAudioDevicePropertyMute.
+enum InputMuteMath {
+    struct SoftMutePlan: Equatable {
+        let appliedPercent: Int
+        let updatedSavedVolume: Int?
+    }
+
+    static func planSoftMute(currentPercent: Int, savedBeforeMute: Int?, targetMuted: Bool) -> SoftMutePlan {
+        let clampedCurrent = min(100, max(0, currentPercent))
+        if targetMuted {
+            let save = clampedCurrent > 0 ? clampedCurrent : (savedBeforeMute ?? 50)
+            return SoftMutePlan(appliedPercent: 0, updatedSavedVolume: max(1, min(100, save)))
+        } else {
+            let restore = clampedCurrent > 0 ? clampedCurrent : max(1, min(100, savedBeforeMute ?? 50))
+            return SoftMutePlan(appliedPercent: restore, updatedSavedVolume: restore)
+        }
     }
 }

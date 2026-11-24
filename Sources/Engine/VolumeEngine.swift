@@ -52,7 +52,12 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
     }
 
     private lazy var hotkeys = Hotkeys { [weak self] key in
-        guard let self, self.phase == .active else { return }
+        guard let self else { return }
+        if key == 4 {
+            self.toggleDefaultMicMute(showHUD: true)
+            return
+        }
+        guard self.phase == .active else { return }
         switch key {
         case 1: self.applyStep(5, source: .hotkey)
         case 2: self.applyStep(-5, source: .hotkey)
@@ -77,6 +82,7 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
 
         installWorkspaceObservers()
         installSystemAudioListeners()
+        _ = hotkeys.registerMicMute()
 
         // Start media key tap immediately if Accessibility is already trusted.
         if MediaKeyTap.isAccessibilityTrusted {
@@ -96,6 +102,7 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
         accessibilityPollTimer?.invalidate()
         accessibilityPollTimer = nil
         dropRoute()
+        hotkeys.unregisterAll()
         mediaKeyTap.stop()
         removeSystemAudioListeners()
         DistributedNotificationCenter.default().removeObserver(self)
@@ -282,6 +289,15 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
                 publishState(writeDisk: true)
                 return
             }
+        case .toggleMicMute:
+            toggleDefaultMicMute(showHUD: true)
+            return
+        case .showMicOSD:
+            if showOSD, let mic = InputDeviceCatalog.currentDefault() {
+                let status = MicrophoneControl.readStatus(for: mic)
+                osd.showMic(volume: status.volumePercent, muted: status.muted, deviceName: mic.name)
+            }
+            return
         case .reverifyCapture:
             verifiedCapture = false
             preferences.set(false, forKey: "CaptureVerified")
@@ -343,6 +359,14 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
         recordTrigger(source)
         updateCurrentDeviceProfile()
         publishState(writeDisk: false)
+    }
+
+    private func toggleDefaultMicMute(showHUD: Bool) {
+        guard let mic = InputDeviceCatalog.currentDefault(),
+              let status = MicrophoneControl.toggleMute(for: mic) else { return }
+        if showHUD && showOSD {
+            osd.showMic(volume: status.volumePercent, muted: status.muted, deviceName: mic.name)
+        }
     }
 
     private func setLimit(_ rawLimit: Int) {
@@ -628,7 +652,7 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
         runningWithZeroSignalSince = nil
         message = reason
         shortcuts = false
-        hotkeys.unregister()
+        hotkeys.unregisterOutput()
         syncMediaKeyIntercept()
     }
 
@@ -700,10 +724,17 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
 
     @objc private func onWatchdogTick() {
         guard !sleeping, phase == .active, let route else { return }
+        if !route.device.isAlive {
+            handleDeviceTopologyChange()
+            return
+        }
         let now = ProcessInfo.processInfo.systemUptime
         let latest = route.callbackCount
         if latest != callbackCount {
             callbackCount = latest
+            lastCallbackTime = now
+        } else if !route.device.isRunningSomewhere {
+            // CoreAudio may pause hardware callbacks during idle silence; avoid spurious reconnect loops.
             lastCallbackTime = now
         } else if now - lastCallbackTime > 3.5 {
             dropRoute(reason: L10n.text("音频通道暂时中断，正在重新连接…", "Audio stream interrupted, reconnecting…"))

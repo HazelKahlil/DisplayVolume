@@ -1,8 +1,14 @@
 import AppKit
 import SwiftUI
 
+private enum OSDMode: Equatable {
+    case output
+    case microphone
+}
+
 @MainActor
 private final class OSDModel: ObservableObject {
+    @Published var mode: OSDMode = .output
     @Published var volume: Int = 0
     @Published var limit: Int = 100
     @Published var muted: Bool = false
@@ -13,10 +19,16 @@ private struct VolumeOSDView: View {
     @ObservedObject var model: OSDModel
 
     private var effectiveVolume: Int {
-        model.muted ? 0 : min(model.volume, model.limit)
+        if model.mode == .microphone {
+            return model.muted ? 0 : min(100, max(0, model.volume))
+        }
+        return model.muted ? 0 : min(model.volume, model.limit)
     }
 
     private var iconName: String {
+        if model.mode == .microphone {
+            return model.muted ? "mic.slash.fill" : "mic.fill"
+        }
         if model.muted || effectiveVolume == 0 { return "speaker.slash.fill" }
         if effectiveVolume < 34 { return "speaker.wave.1.fill" }
         if effectiveVolume < 68 { return "speaker.wave.2.fill" }
@@ -24,7 +36,7 @@ private struct VolumeOSDView: View {
     }
 
     private var atCap: Bool {
-        !model.muted && model.limit < 100 && model.volume >= model.limit
+        model.mode == .output && !model.muted && model.limit < 100 && model.volume >= model.limit
     }
 
     var body: some View {
@@ -34,53 +46,64 @@ private struct VolumeOSDView: View {
                 .foregroundStyle(model.muted ? Color.secondary : Color.primary)
                 .frame(width: 20)
 
-            GeometryReader { geo in
-                let width = geo.size.width
-                let fillFraction = CGFloat(max(0, min(100, effectiveVolume))) / 100.0
-                let limitFraction = CGFloat(max(1, min(100, model.limit))) / 100.0
+            if model.mode == .microphone && model.muted {
+                Text(L10n.micMutedOSDLabel)
+                    .font(.system(size: 12.5, weight: .semibold))
+                    .foregroundStyle(.primary)
+                Spacer(minLength: 4)
+                Text(model.deviceName)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            } else {
+                GeometryReader { geo in
+                    let width = geo.size.width
+                    let fillFraction = CGFloat(max(0, min(100, effectiveVolume))) / 100.0
+                    let limitFraction = CGFloat(max(1, min(100, model.limit))) / 100.0
 
-                ZStack(alignment: .leading) {
-                    Capsule()
-                        .fill(Color.primary.opacity(0.14))
-
-                    if model.limit < 100 {
-                        HStack(spacing: 0) {
-                            Spacer(minLength: 0)
-                            Rectangle()
-                                .fill(Color.primary.opacity(0.06))
-                                .frame(width: max(0, width * (1.0 - limitFraction)))
-                        }
-                        .clipShape(Capsule())
-                    }
-
-                    Capsule()
-                        .fill(model.muted ? Color.secondary.opacity(0.45) : Color.primary.opacity(0.88))
-                        .frame(width: max(effectiveVolume > 0 ? 6 : 0, width * fillFraction))
-                        .animation(.interactiveSpring(response: 0.14, dampingFraction: 0.88), value: effectiveVolume)
-
-                    if model.limit < 100 {
+                    ZStack(alignment: .leading) {
                         Capsule()
-                            .fill(Color.primary.opacity(0.42))
-                            .frame(width: 2, height: 9)
-                            .offset(x: max(0, min(width - 2, width * limitFraction - 1)))
+                            .fill(Color.primary.opacity(0.14))
+
+                        if model.mode == .output && model.limit < 100 {
+                            HStack(spacing: 0) {
+                                Spacer(minLength: 0)
+                                Rectangle()
+                                    .fill(Color.primary.opacity(0.06))
+                                    .frame(width: max(0, width * (1.0 - limitFraction)))
+                            }
+                            .clipShape(Capsule())
+                        }
+
+                        Capsule()
+                            .fill(model.muted ? Color.secondary.opacity(0.45) : Color.primary.opacity(0.88))
+                            .frame(width: max(effectiveVolume > 0 ? 6 : 0, width * fillFraction))
+                            .animation(.interactiveSpring(response: 0.14, dampingFraction: 0.88), value: effectiveVolume)
+
+                        if model.mode == .output && model.limit < 100 {
+                            Capsule()
+                                .fill(Color.primary.opacity(0.42))
+                                .frame(width: 2, height: 9)
+                                .offset(x: max(0, min(width - 2, width * limitFraction - 1)))
+                        }
                     }
                 }
-            }
-            .frame(height: 6)
+                .frame(height: 6)
 
-            HStack(spacing: 4) {
-                Text(model.muted ? L10n.mutedLabel : "\(effectiveVolume)%")
-                    .font(.system(size: 12.5, weight: .semibold, design: .rounded).monospacedDigit())
-                    .foregroundStyle(model.muted ? .secondary : .primary)
-                    .frame(minWidth: 34, alignment: .trailing)
+                HStack(spacing: 4) {
+                    Text(model.muted ? L10n.mutedLabel : "\(effectiveVolume)%")
+                        .font(.system(size: 12.5, weight: .semibold, design: .rounded).monospacedDigit())
+                        .foregroundStyle(model.muted ? .secondary : .primary)
+                        .frame(minWidth: 34, alignment: .trailing)
 
-                if atCap {
-                    Text(L10n.limitWord)
-                        .font(.system(size: 9, weight: .semibold))
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 1.5)
-                        .background(Color.primary.opacity(0.10), in: Capsule())
-                        .foregroundStyle(.secondary)
+                    if atCap {
+                        Text(L10n.limitWord)
+                            .font(.system(size: 9, weight: .semibold))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1.5)
+                            .background(Color.primary.opacity(0.10), in: Capsule())
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
         }
@@ -118,11 +141,24 @@ final class VolumeOSD {
     private var hideWork: DispatchWorkItem?
 
     func show(volume: Int, limit: Int, muted: Bool, deviceName: String) {
+        model.mode = .output
         model.volume = volume
         model.limit = limit
         model.muted = muted
         model.deviceName = deviceName
+        present()
+    }
 
+    func showMic(volume: Int, muted: Bool, deviceName: String) {
+        model.mode = .microphone
+        model.volume = volume
+        model.limit = 100
+        model.muted = muted
+        model.deviceName = deviceName
+        present()
+    }
+
+    private func present() {
         let panel = ensurePanel()
         positionTopRight(panel)
 
@@ -177,7 +213,7 @@ final class VolumeOSD {
         hosting.frame = NSRect(x: 0, y: 0, width: totalWidth, height: totalHeight)
         hosting.autoresizingMask = []
 
-        // Place hosting view inside a layer-less container view (matching AgentGauge) so shadow bloom never clips.
+        // Place hosting view inside a layer-less container view so shadow bloom never clips.
         let container = NSView(frame: NSRect(x: 0, y: 0, width: totalWidth, height: totalHeight))
         container.wantsLayer = false
         container.autoresizesSubviews = false

@@ -8,27 +8,61 @@ import SwiftUI
 final class VolumeController: NSObject, ObservableObject {
     @Published private(set) var state = VolumeIPC.read()
     @Published private(set) var outputDevices: [AudioDeviceInfo] = []
+    @Published private(set) var currentOutputDevice: AudioDeviceInfo? = OutputDeviceCatalog.currentDefault()
+    @Published private(set) var inputDevices: [AudioDeviceInfo] = []
+    @Published private(set) var currentInputDevice: AudioDeviceInfo? = InputDeviceCatalog.currentDefault()
     @Published private(set) var uiAccessibilityTrusted = MediaKeyTap.isAccessibilityTrusted
 
+    // Software output optimistic state (for DisplayPort/HDMI locked monitors)
     @Published private var optimisticVolume: Int?
     @Published private var optimisticLimit: Int?
     @Published private var optimisticMuted: Bool?
 
+    // Native hardware output state (for MacBook speakers / AirPods / USB DACs)
+    @Published private(set) var nativeOutputVolume: Int = 50
+    @Published private(set) var nativeOutputMuted: Bool = false
+
+    // Microphone / Input state
+    @Published private(set) var inputVolume: Int = 50
+    @Published private(set) var inputMuted: Bool = false
+    @Published private(set) var inputVolumeWritable: Bool = false
+    @Published private(set) var inputMuteSupported: Bool = false
+    @Published private(set) var inputUsesSoftMute: Bool = false
+
     private var volumeLockUntil: TimeInterval = 0
     private var limitLockUntil: TimeInterval = 0
+    private var nativeOutLockUntil: TimeInterval = 0
+    private var inputLockUntil: TimeInterval = 0
     private var isDraggingVolume = false
     private var isDraggingLimit = false
+    private var isDraggingNativeOut = false
+    private var isDraggingInput = false
     private var lastVolumeIPCSentAt: TimeInterval = 0
     private var lastLimitIPCSentAt: TimeInterval = 0
 
     private var heartbeat: Timer?
     private var axPollTimer: Timer?
     private var scrollAccumulator: CGFloat = 0
+
+    // CoreAudio HAL listeners for zero-latency sync with macOS System Settings & Control Center
+    private var systemListenersInstalled = false
+    private var systemDefaultOutBlock: AudioObjectPropertyListenerBlock?
+    private var systemDefaultInBlock: AudioObjectPropertyListenerBlock?
+    private var systemDevicesBlock: AudioObjectPropertyListenerBlock?
+
+    private var observedNativeOutID: AudioDeviceID = kAudioObjectUnknown
+    private var nativeOutListeners: [(AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] = []
+
+    private var observedInputID: AudioDeviceID = kAudioObjectUnknown
+    private var inputListeners: [(AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] = []
+
     var onChange: (() -> Void)?
 
     private lazy var uiMediaKeyTap = MediaKeyTap { [weak self] action in
         self?.handleMediaKeyAction(action)
     }
+
+    // MARK: - Derived Output State
 
     var phase: VolumeState.Phase { state?.phase ?? .idle }
     var volumeLimit: Int { optimisticLimit ?? state?.volumeLimit ?? 100 }
@@ -42,12 +76,38 @@ final class VolumeController: NSObject, ObservableObject {
     var showOSD: Bool { state?.showOSD ?? true }
     var showMenuBarPercent: Bool { state?.showMenuBarPercent ?? false }
     var scrollOnIconEnabled: Bool { state?.scrollOnIconEnabled ?? true }
-    var deviceUID: String? { state?.deviceUID }
-    var deviceName: String? { state?.deviceName }
-    var transportLabel: String? { state?.transportLabel }
+    var deviceUID: String? { currentOutputDevice?.uid ?? state?.deviceUID }
+    var deviceName: String? { currentOutputDevice?.name ?? state?.deviceName }
+    var transportLabel: String? { currentOutputDevice?.transportKind.displayLabel ?? state?.transportLabel }
     var isEngineConnected: Bool { state != nil }
-    var isControllable: Bool { state?.isControllable ?? false }
+    var isControllable: Bool { state?.isControllable ?? (currentOutputDevice?.isAutoControllable ?? false) }
     var isEnabled: Bool { state?.enabled ?? false }
+
+    var isSoftwareOutputActive: Bool { phase == .active && isControllable }
+    var isNativeHardwareOutput: Bool { !isControllable && (currentOutputDevice?.volumeControlAvailable == true) }
+    var canControlCurrentOutput: Bool { isSoftwareOutputActive || isNativeHardwareOutput }
+
+    var effectiveOutputVolume: Int {
+        if isSoftwareOutputActive { return shownVolume }
+        if isNativeHardwareOutput { return nativeOutputMuted ? 0 : nativeOutputVolume }
+        return 0
+    }
+
+    var effectiveOutputLimit: Int {
+        isSoftwareOutputActive ? volumeLimit : 100
+    }
+
+    var effectiveOutputMuted: Bool {
+        if isSoftwareOutputActive { return muted }
+        if isNativeHardwareOutput { return nativeOutputMuted }
+        return false
+    }
+
+    var shownInputVolume: Int {
+        inputMuted ? 0 : inputVolume
+    }
+
+    // MARK: - Lifecycle
 
     func beginMonitoring() {
         DistributedNotificationCenter.default().addObserver(
@@ -62,7 +122,8 @@ final class VolumeController: NSObject, ObservableObject {
         RunLoop.main.add(timer, forMode: .common)
         heartbeat = timer
 
-        refreshOutputDevices()
+        installSystemAudioListeners()
+        refreshAllAudioDevices()
         syncUIMediaKeyTap()
     }
 
@@ -71,6 +132,7 @@ final class VolumeController: NSObject, ObservableObject {
         heartbeat = nil
         axPollTimer?.invalidate()
         axPollTimer = nil
+        removeSystemAudioListeners()
         if uiMediaKeyTap.isRunning {
             VolumeIPC.send(.setUIMediaKeysActive, flag: false)
         }
@@ -78,8 +140,27 @@ final class VolumeController: NSObject, ObservableObject {
         DistributedNotificationCenter.default().removeObserver(self)
     }
 
+    // MARK: - Device & Hardware Sync
+
+    func refreshAllAudioDevices() {
+        refreshOutputDevices()
+        refreshInputDevices()
+    }
+
     func refreshOutputDevices() {
         outputDevices = OutputDeviceCatalog.allOutputDevices()
+        currentOutputDevice = OutputDeviceCatalog.currentDefault()
+        installNativeOutputListeners(for: currentOutputDevice)
+        syncNativeOutputHardwareState(force: false)
+        onChange?()
+    }
+
+    func refreshInputDevices() {
+        inputDevices = InputDeviceCatalog.allInputDevices()
+        currentInputDevice = InputDeviceCatalog.currentDefault()
+        installInputListeners(for: currentInputDevice)
+        syncInputHardwareState(force: false)
+        onChange?()
     }
 
     func refreshAccessibilityState() {
@@ -93,9 +174,181 @@ final class VolumeController: NSObject, ObservableObject {
 
     func selectOutputDevice(uid: String) {
         if OutputDeviceCatalog.setDefaultOutput(uid: uid) {
+            nativeOutLockUntil = 0
             refreshOutputDevices()
         }
     }
+
+    func selectInputDevice(uid: String) {
+        if InputDeviceCatalog.setDefaultInput(uid: uid) {
+            inputLockUntil = 0
+            refreshInputDevices()
+        }
+    }
+
+    private func syncNativeOutputHardwareState(force: Bool) {
+        guard let dev = currentOutputDevice, dev.volumeControlAvailable else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard force || (!isDraggingNativeOut && now >= nativeOutLockUntil) else { return }
+
+        if let scalar = AudioHardwareControl.readScalarVolume(
+            deviceID: dev.id,
+            scope: kAudioDevicePropertyScopeOutput,
+            channelCount: dev.outputChannels
+        ) {
+            nativeOutputVolume = Int((scalar * 100.0).rounded())
+        }
+        if let hwMuted = AudioHardwareControl.readMute(
+            deviceID: dev.id,
+            scope: kAudioDevicePropertyScopeOutput,
+            channelCount: dev.outputChannels
+        ) {
+            nativeOutputMuted = hwMuted
+        } else {
+            nativeOutputMuted = (nativeOutputVolume == 0)
+        }
+    }
+
+    private func syncInputHardwareState(force: Bool) {
+        guard let mic = currentInputDevice else {
+            inputVolume = 0
+            inputMuted = false
+            inputVolumeWritable = false
+            inputMuteSupported = false
+            inputUsesSoftMute = false
+            return
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        let status = MicrophoneControl.readStatus(for: mic)
+        inputVolumeWritable = status.volumeWritable
+        inputMuteSupported = status.muteSupported
+        inputUsesSoftMute = status.usesSoftMute
+        guard force || (!isDraggingInput && now >= inputLockUntil) else { return }
+        inputVolume = status.volumePercent
+        inputMuted = status.muted
+    }
+
+    // MARK: - CoreAudio Property Listeners
+
+    private func installSystemAudioListeners() {
+        guard !systemListenersInstalled else { return }
+        systemListenersInstalled = true
+
+        var outAddr = audioAddress(kAudioHardwarePropertyDefaultOutputDevice)
+        let outBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            Task { @MainActor in self?.refreshOutputDevices() }
+        }
+        if AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &outAddr, DispatchQueue.main, outBlock) == noErr {
+            systemDefaultOutBlock = outBlock
+        }
+
+        var inAddr = audioAddress(kAudioHardwarePropertyDefaultInputDevice)
+        let inBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            Task { @MainActor in self?.refreshInputDevices() }
+        }
+        if AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &inAddr, DispatchQueue.main, inBlock) == noErr {
+            systemDefaultInBlock = inBlock
+        }
+
+        var devAddr = audioAddress(kAudioHardwarePropertyDevices)
+        let devBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            Task { @MainActor in self?.refreshAllAudioDevices() }
+        }
+        if AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &devAddr, DispatchQueue.main, devBlock) == noErr {
+            systemDevicesBlock = devBlock
+        }
+    }
+
+    private func removeSystemAudioListeners() {
+        removeNativeOutputListeners()
+        removeInputListeners()
+        if let block = systemDefaultOutBlock {
+            var addr = audioAddress(kAudioHardwarePropertyDefaultOutputDevice)
+            AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &addr, DispatchQueue.main, block)
+        }
+        if let block = systemDefaultInBlock {
+            var addr = audioAddress(kAudioHardwarePropertyDefaultInputDevice)
+            AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &addr, DispatchQueue.main, block)
+        }
+        if let block = systemDevicesBlock {
+            var addr = audioAddress(kAudioHardwarePropertyDevices)
+            AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &addr, DispatchQueue.main, block)
+        }
+        systemDefaultOutBlock = nil
+        systemDefaultInBlock = nil
+        systemDevicesBlock = nil
+        systemListenersInstalled = false
+    }
+
+    private func installNativeOutputListeners(for device: AudioDeviceInfo?) {
+        let targetID = (device?.volumeControlAvailable == true) ? device!.id : AudioDeviceID(kAudioObjectUnknown)
+        if observedNativeOutID == targetID { return }
+        removeNativeOutputListeners()
+        guard targetID != kAudioObjectUnknown else { return }
+        observedNativeOutID = targetID
+
+        for selector in [kAudioDevicePropertyVolumeScalar, kAudioDevicePropertyMute] {
+            for element: UInt32 in [0, 1, 2] {
+                var prop = audioAddress(selector, scope: kAudioDevicePropertyScopeOutput, element: element)
+                guard AudioObjectHasProperty(targetID, &prop) else { continue }
+                let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+                    Task { @MainActor in
+                        self?.syncNativeOutputHardwareState(force: false)
+                        self?.onChange?()
+                    }
+                }
+                if AudioObjectAddPropertyListenerBlock(targetID, &prop, DispatchQueue.main, block) == noErr {
+                    nativeOutListeners.append((prop, block))
+                }
+            }
+        }
+    }
+
+    private func removeNativeOutputListeners() {
+        if observedNativeOutID != kAudioObjectUnknown {
+            for (var prop, block) in nativeOutListeners {
+                AudioObjectRemovePropertyListenerBlock(observedNativeOutID, &prop, DispatchQueue.main, block)
+            }
+        }
+        nativeOutListeners.removeAll()
+        observedNativeOutID = kAudioObjectUnknown
+    }
+
+    private func installInputListeners(for device: AudioDeviceInfo?) {
+        let targetID = device?.id ?? AudioDeviceID(kAudioObjectUnknown)
+        if observedInputID == targetID { return }
+        removeInputListeners()
+        guard targetID != kAudioObjectUnknown else { return }
+        observedInputID = targetID
+
+        for selector in [kAudioDevicePropertyVolumeScalar, kAudioDevicePropertyMute] {
+            for element: UInt32 in [0, 1, 2] {
+                var prop = audioAddress(selector, scope: kAudioDevicePropertyScopeInput, element: element)
+                guard AudioObjectHasProperty(targetID, &prop) else { continue }
+                let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+                    Task { @MainActor in
+                        self?.syncInputHardwareState(force: false)
+                        self?.onChange?()
+                    }
+                }
+                if AudioObjectAddPropertyListenerBlock(targetID, &prop, DispatchQueue.main, block) == noErr {
+                    inputListeners.append((prop, block))
+                }
+            }
+        }
+    }
+
+    private func removeInputListeners() {
+        if observedInputID != kAudioObjectUnknown {
+            for (var prop, block) in inputListeners {
+                AudioObjectRemovePropertyListenerBlock(observedInputID, &prop, DispatchQueue.main, block)
+            }
+        }
+        inputListeners.removeAll()
+        observedInputID = kAudioObjectUnknown
+    }
+
+    // MARK: - Engine IPC Sync
 
     @objc private func handleStateNotification(_ notification: Notification) {
         let latest = VolumeIPC.read(from: notification)
@@ -134,6 +387,8 @@ final class VolumeController: NSObject, ObservableObject {
         refreshFromDisk()
         refreshAccessibilityState()
     }
+
+    // MARK: - Media Keys & Scroll
 
     private func syncUIMediaKeyTap() {
         let trusted = MediaKeyTap.isAccessibilityTrusted
@@ -184,19 +439,47 @@ final class VolumeController: NSObject, ObservableObject {
     }
 
     func handleScrollDelta(_ deltaY: CGFloat) {
-        guard scrollOnIconEnabled, phase == .active else { return }
+        guard scrollOnIconEnabled else { return }
         scrollAccumulator += deltaY
         let stepThreshold: CGFloat = 4.0
         guard abs(scrollAccumulator) >= stepThreshold else { return }
         let steps = Int((scrollAccumulator / stepThreshold).rounded(.towardZero))
         scrollAccumulator -= CGFloat(steps) * stepThreshold
-        if steps != 0 {
+        guard steps != 0 else { return }
+
+        if isSoftwareOutputActive {
             VolumeIPC.send(.step, value: steps * 2, source: .scroll)
+        } else if isNativeHardwareOutput {
+            let next = VolumeMath.applyStep(
+                currentVolume: nativeOutputVolume,
+                limit: 100,
+                muted: nativeOutputMuted,
+                delta: steps * 2
+            )
+            setNativeOutputVolume(next.muted ? 0 : next.volume, isDragging: false)
         }
     }
 
+    // MARK: - Output Mutations (Software + Native Hardware)
+
     func enable() { VolumeIPC.send(.enable) }
     func disable() { VolumeIPC.send(.pause) }
+
+    func setActiveOutputVolume(_ percent: Int, isDragging: Bool = false) {
+        if isSoftwareOutputActive {
+            setVolume(percent, isDragging: isDragging)
+        } else if isNativeHardwareOutput {
+            setNativeOutputVolume(percent, isDragging: isDragging)
+        }
+    }
+
+    func toggleActiveOutputMute() {
+        if isSoftwareOutputActive {
+            toggleMute()
+        } else if isNativeHardwareOutput {
+            toggleNativeOutputMute()
+        }
+    }
 
     func setVolume(_ percent: Int, isDragging: Bool = false) {
         let clamped = VolumeMath.clampedVolume(percent, limit: volumeLimit)
@@ -242,8 +525,106 @@ final class VolumeController: NSObject, ObservableObject {
         VolumeIPC.send(.mute, source: .slider)
     }
 
+    func setNativeOutputVolume(_ percent: Int, isDragging: Bool = false) {
+        guard let dev = currentOutputDevice, dev.volumeControlAvailable else { return }
+        let clamped = min(100, max(0, percent))
+        let now = ProcessInfo.processInfo.systemUptime
+        isDraggingNativeOut = isDragging
+        nativeOutLockUntil = now + 0.25
+        nativeOutputVolume = clamped
+        nativeOutputMuted = (clamped == 0)
+
+        _ = AudioHardwareControl.writeScalarVolume(
+            deviceID: dev.id,
+            scope: kAudioDevicePropertyScopeOutput,
+            channelCount: dev.outputChannels,
+            fraction: Float(clamped) / 100.0
+        )
+        if dev.muteControlAvailable {
+            _ = AudioHardwareControl.writeMute(
+                deviceID: dev.id,
+                scope: kAudioDevicePropertyScopeOutput,
+                channelCount: dev.outputChannels,
+                muted: clamped == 0
+            )
+        }
+        onChange?()
+    }
+
+    func toggleNativeOutputMute() {
+        guard let dev = currentOutputDevice, dev.volumeControlAvailable else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        nativeOutLockUntil = now + 0.25
+        let targetMuted = !nativeOutputMuted
+        nativeOutputMuted = targetMuted
+
+        if dev.muteControlAvailable {
+            _ = AudioHardwareControl.writeMute(
+                deviceID: dev.id,
+                scope: kAudioDevicePropertyScopeOutput,
+                channelCount: dev.outputChannels,
+                muted: targetMuted
+            )
+            if !targetMuted && nativeOutputVolume == 0 {
+                nativeOutputVolume = 25
+                _ = AudioHardwareControl.writeScalarVolume(
+                    deviceID: dev.id,
+                    scope: kAudioDevicePropertyScopeOutput,
+                    channelCount: dev.outputChannels,
+                    fraction: 0.25
+                )
+            }
+        } else {
+            let applied = targetMuted ? 0 : max(10, nativeOutputVolume)
+            _ = AudioHardwareControl.writeScalarVolume(
+                deviceID: dev.id,
+                scope: kAudioDevicePropertyScopeOutput,
+                channelCount: dev.outputChannels,
+                fraction: Float(applied) / 100.0
+            )
+        }
+        onChange?()
+    }
+
+    // MARK: - Input / Microphone Mutations
+
+    func setInputVolume(_ percent: Int, isDragging: Bool = false) {
+        guard let mic = currentInputDevice, mic.inputVolumeControlAvailable else { return }
+        let clamped = min(100, max(0, percent))
+        let now = ProcessInfo.processInfo.systemUptime
+        isDraggingInput = isDragging
+        inputLockUntil = now + 0.25
+        if clamped > 0 {
+            inputVolume = clamped
+            inputMuted = false
+        } else {
+            inputVolume = clamped
+            if !mic.inputMuteControlAvailable {
+                inputMuted = true
+            }
+        }
+
+        _ = MicrophoneControl.setVolume(clamped, for: mic)
+        onChange?()
+    }
+
+    func toggleInputMute(showOSD: Bool = false) {
+        guard let mic = currentInputDevice, mic.inputMuteSupported else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        inputLockUntil = now + 0.25
+        if let updated = MicrophoneControl.toggleMute(for: mic) {
+            inputVolume = updated.volumePercent
+            inputMuted = updated.muted
+            if showOSD {
+                VolumeIPC.send(.showMicOSD)
+            }
+            onChange?()
+        }
+    }
+
+    // MARK: - Accessibility & Preferences
+
     func requestAccessibility() {
-        // Request permission on the main user-facing app ("桌面音量") so the user sees it directly in Applications.
         NSApp.activate(ignoringOtherApps: true)
         _ = MediaKeyTap.requestAccessibilityPrompt()
         refreshAccessibilityState()
@@ -414,15 +795,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
         if CommandLine.arguments.contains("--diagnose") {
-            let devices = OutputDeviceCatalog.allOutputDevices()
-            let current = OutputDeviceCatalog.currentDefault()
-            print("Default output: \(current?.name ?? "None") (\(current?.transportKind.displayLabel ?? "-"))")
-            print("Native scalar volume available: \(current?.volumeControlAvailable ?? false)")
-            print("Auto-controllable: \(current?.isAutoControllable ?? false)")
+            let outputs = OutputDeviceCatalog.allOutputDevices()
+            let currentOut = OutputDeviceCatalog.currentDefault()
+            let inputs = InputDeviceCatalog.allInputDevices()
+            let currentIn = InputDeviceCatalog.currentDefault()
+
+            print("Default output: \(currentOut?.name ?? "None") (\(currentOut?.transportKind.displayLabel ?? "-"))")
+            print("  Native scalar volume: \(currentOut?.volumeControlAvailable ?? false), mute: \(currentOut?.muteControlAvailable ?? false)")
+            print("  Auto-controllable (software): \(currentOut?.isAutoControllable ?? false)")
+            if let currentIn {
+                let micStatus = MicrophoneControl.readStatus(for: currentIn)
+                print("Default input: \(currentIn.name) (\(currentIn.transportKind.displayLabel))")
+                print("  Input volume: \(micStatus.volumePercent)% (writable=\(micStatus.volumeWritable)), muted=\(micStatus.muted) (muteSupported=\(micStatus.muteSupported), softMute=\(micStatus.usesSoftMute))")
+            } else {
+                print("Default input: None")
+            }
             print("UI Accessibility trusted: \(MediaKeyTap.isAccessibilityTrusted)")
-            print("All outputs (\(devices.count)):")
-            for dev in devices {
-                print("  - \(dev.name) [\(dev.transportKind.displayLabel)] controllable=\(dev.isAutoControllable)")
+            print("All outputs (\(outputs.count)):")
+            for dev in outputs {
+                print("  - \(dev.name) [\(dev.transportKind.displayLabel)] sw=\(dev.isAutoControllable) hwVol=\(dev.volumeControlAvailable)")
+            }
+            print("All inputs (\(inputs.count)):")
+            for dev in inputs {
+                print("  - \(dev.name) [\(dev.transportKind.displayLabel)] inVol=\(dev.inputVolumeControlAvailable) inMute=\(dev.inputMuteControlAvailable)")
             }
             return
         }
@@ -451,7 +846,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
             )
         )
-        popover.contentSize = NSSize(width: 300, height: 320)
+        popover.contentSize = NSSize(width: 312, height: 420)
 
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem = item
@@ -483,7 +878,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             MainActor.assumeIsolated { self?.closePopover() }
         }
 
-        if CommandLine.arguments.contains("--open-popover") || model.phase != .active {
+        if CommandLine.arguments.contains("--open-popover") || (model.isControllable && model.phase != .active) {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
                 self?.showPopover()
             }
@@ -539,7 +934,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             closePopover()
         } else {
             model.refreshFromDisk()
-            model.refreshOutputDevices()
+            model.refreshAllAudioDevices()
             model.refreshAccessibilityState()
             showPopover()
         }
@@ -547,15 +942,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private func showQuickContextMenu(_ button: NSStatusBarButton) {
         closePopover()
+        model.refreshAllAudioDevices()
+
         let menu = NSMenu()
-        if model.phase == .active {
-            let muteTitle = model.muted ? L10n.text("取消静音", "Unmute") : L10n.text("静音", "Mute")
-            let muteItem = NSMenuItem(title: muteTitle, action: #selector(menuToggleMute), keyEquivalent: "")
+        if model.canControlCurrentOutput {
+            let muteTitle = model.effectiveOutputMuted
+                ? L10n.text("取消静音输出", "Unmute Output")
+                : L10n.text("静音输出", "Mute Output")
+            let muteItem = NSMenuItem(title: muteTitle, action: #selector(menuToggleOutputMute), keyEquivalent: "")
             muteItem.target = self
             menu.addItem(muteItem)
         }
+        if model.inputMuteSupported {
+            let micTitle = model.inputMuted
+                ? L10n.text("取消静音麦克风", "Unmute Microphone")
+                : L10n.text("静音麦克风", "Mute Microphone")
+            let micItem = NSMenuItem(title: micTitle, action: #selector(menuToggleMicMute), keyEquivalent: "")
+            micItem.target = self
+            menu.addItem(micItem)
+        }
         if model.isControllable {
-            let toggleTitle = model.isEnabled ? L10n.text("暂停软件音量", "Pause Software Volume") : L10n.text("启用软件音量", "Enable Software Volume")
+            let toggleTitle = model.isEnabled
+                ? L10n.text("暂停软件音量", "Pause Software Volume")
+                : L10n.text("启用软件音量", "Enable Software Volume")
             let toggleItem = NSMenuItem(title: toggleTitle, action: #selector(menuToggleEnable), keyEquivalent: "")
             toggleItem.target = self
             menu.addItem(toggleItem)
@@ -572,7 +981,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height + 4), in: button)
     }
 
-    @objc private func menuToggleMute() { model.toggleMute() }
+    @objc private func menuToggleOutputMute() { model.toggleActiveOutputMute() }
+    @objc private func menuToggleMicMute() { model.toggleInputMute(showOSD: true) }
     @objc private func menuToggleEnable() {
         if model.isEnabled { model.disable() } else { model.enable() }
     }
@@ -613,18 +1023,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private func updateStatusItemAppearance() {
         guard let button = statusItem?.button else { return }
-        let label = model.phase == .active
-            ? (model.muted ? L10n.mutedLabel : "\(L10n.appName) \(model.shownVolume)%")
+        let outActive = model.canControlCurrentOutput
+        let baseLabel = outActive
+            ? (model.effectiveOutputMuted ? L10n.mutedLabel : "\(L10n.appName) \(model.effectiveOutputVolume)%")
             : L10n.appName
+        let fullLabel = model.inputMuted
+            ? "\(baseLabel) · \(L10n.micMutedOSDLabel)"
+            : baseLabel
+
         let image = MenuBarIconRenderer.makeIcon(
-            volume: model.shownVolume,
-            muted: model.muted,
-            active: model.phase == .active
+            volume: model.effectiveOutputVolume,
+            muted: model.effectiveOutputMuted,
+            active: outActive
         )
         button.image = image
-        button.imagePosition = model.showMenuBarPercent && model.phase == .active ? .imageLeading : .imageOnly
-        if model.showMenuBarPercent && model.phase == .active {
-            let text = model.muted ? L10n.mutedLabel : "\(model.shownVolume)%"
+        button.imagePosition = model.showMenuBarPercent && outActive ? .imageLeading : .imageOnly
+        if model.showMenuBarPercent && outActive {
+            let text = model.effectiveOutputMuted ? L10n.mutedLabel : "\(model.effectiveOutputVolume)%"
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .medium)
             ]
@@ -632,8 +1047,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         } else {
             button.title = ""
         }
-        button.setAccessibilityLabel(label)
-        button.toolTip = label
+        button.setAccessibilityLabel(fullLabel)
+        button.toolTip = fullLabel
     }
 }
 
@@ -645,8 +1060,12 @@ private func runSelfTestSuite() {
     let step3 = VolumeMath.applyStep(currentVolume: 3, limit: 100, muted: false, delta: -5) == (3, true)
     let step4 = VolumeMath.applyStep(currentVolume: 3, limit: 100, muted: true, delta: 5) == (3, false)
     let step5 = VolumeMath.applyStep(currentVolume: 40, limit: 100, muted: true, delta: -5) == (40, true)
+    let mic1 = InputMuteMath.planSoftMute(currentPercent: 85, savedBeforeMute: nil, targetMuted: true)
+        == .init(appliedPercent: 0, updatedSavedVolume: 85)
+    let mic2 = InputMuteMath.planSoftMute(currentPercent: 0, savedBeforeMute: 85, targetMuted: false)
+        == .init(appliedPercent: 85, updatedSavedVolume: 85)
 
-    let ok = clamped1 && clamped2 && step1 && step2 && step3 && step4 && step5
-    print(ok ? "PASS app volume math tests" : "FAIL app volume math tests")
+    let ok = clamped1 && clamped2 && step1 && step2 && step3 && step4 && step5 && mic1 && mic2
+    print(ok ? "PASS app volume & microphone math tests" : "FAIL app volume & microphone math tests")
     exit(ok ? 0 : 1)
 }
