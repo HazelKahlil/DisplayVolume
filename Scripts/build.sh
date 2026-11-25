@@ -76,7 +76,7 @@ xcrun --sdk macosx swiftc -sdk "$sdk" -target "$target" -O -warnings-as-errors \
   -o "$scratch/RunTests" &
 pid_tests=$!
 
-xcrun --sdk macosx swiftc -sdk "$sdk" -target "$target" -O -warnings-as-errors "${swift_sdk_flags[@]}" \
+xcrun --sdk macosx swiftc -sdk "$sdk" -target "$target" -O -warnings-as-errors ${swift_sdk_flags[@]+"${swift_sdk_flags[@]}"} \
   -import-objc-header Sources/Engine/AudioGain.h \
   Sources/Shared/Localization.swift \
   Sources/Shared/AudioDevice.swift \
@@ -92,7 +92,7 @@ xcrun --sdk macosx swiftc -sdk "$sdk" -target "$target" -O -warnings-as-errors "
   -o "$engine_bundle/Contents/MacOS/DisplayVolumeEngine" &
 pid_engine=$!
 
-xcrun --sdk macosx swiftc -sdk "$sdk" -target "$target" -O -warnings-as-errors "${swift_sdk_flags[@]}" \
+xcrun --sdk macosx swiftc -sdk "$sdk" -target "$target" -O -warnings-as-errors ${swift_sdk_flags[@]+"${swift_sdk_flags[@]}"} \
   Sources/Shared/Localization.swift \
   Sources/Shared/AudioDevice.swift \
   Sources/Shared/VolumeModel.swift \
