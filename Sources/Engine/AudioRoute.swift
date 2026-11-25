@@ -1,14 +1,16 @@
 import CoreAudio
 import Foundation
 
-final class AudioRoute {
+/// Manages a CoreAudio Process Tap + Private Aggregate Device + real-time C17 GainState.
+/// All lifecycle calls (`start` / `activate` / `stop`) should be invoked on a dedicated serial queue
+/// so AudioDeviceStart/Stop never stall the main thread.
+final class AudioRoute: @unchecked Sendable {
     let device: AudioDeviceInfo
     var onStreamFormatChanged: (() -> Void)?
 
     private var tap: AudioObjectID = kAudioObjectUnknown
     private var aggregate: AudioDeviceID = kAudioObjectUnknown
-    private var outputStreamID: AudioStreamID = kAudioObjectUnknown
-    private var formatListenerBlock: AudioObjectPropertyListenerBlock?
+    private var observedListeners: [(AudioObjectID, AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] = []
     private var callback: AudioDeviceIOProcID?
     private var gain: OpaquePointer?
     private var tapDescription: CATapDescription?
@@ -20,8 +22,8 @@ final class AudioRoute {
 
     deinit { stop() }
 
-    /// Starts the CoreAudio process tap. If `immediateVolume` is supplied (permission already verified),
-    /// attenuation engages synchronously before audio starts so the first millisecond never blasts at 100%.
+    /// Starts the CoreAudio process tap. Uses `kAudioAggregateDeviceTapAutoStartKey = false` so
+    /// `AudioDeviceStart` starts immediately without blocking waiting indefinitely for first client audio.
     func start(immediateVolume: Double? = nil) throws {
         guard OutputDeviceCatalog.currentDefault()?.uid == device.uid,
               device.isAlive else {
@@ -47,7 +49,7 @@ final class AudioRoute {
                     kAudioSubTapUIDKey: description.uuid.uuidString,
                     kAudioSubTapDriftCompensationKey: true
                 ]],
-                kAudioAggregateDeviceTapAutoStartKey: true
+                kAudioAggregateDeviceTapAutoStartKey: false
             ]
             try checkAudio(
                 AudioHardwareCreateAggregateDevice(config as CFDictionary, &aggregate),
@@ -63,7 +65,7 @@ final class AudioRoute {
                 GainSetVolume(state, Float(immediateVolume))
                 GainEnableOutput(state)
             }
-            installFormatListener(streamID: spec.outputStream)
+            installFormatListeners(inputStream: spec.inputStream, outputStream: spec.outputStream)
             try checkAudio(GainInstallIOProc(aggregate, state, &callback), L10n.text("安装音频回调", "Install IOProc"))
             try checkAudio(AudioDeviceStart(aggregate, callback), L10n.text("启动音频处理", "Start audio route"))
             started = true
@@ -95,47 +97,69 @@ final class AudioRoute {
     var hasSignal: Bool { gain.map(GainSawSignal) ?? false }
     var layoutChanged: Bool { gain.map(GainHasLayoutError) ?? false }
     var callbackCount: UInt32 { gain.map(GainCallbackCount) ?? 0 }
+    var renderedCallbackCount: UInt32 { gain.map(GainRenderedCallbackCount) ?? 0 }
 
     func stop() {
-        removeFormatListener()
+        removeFormatListeners()
+        var safeToDestroyGain = true
+
         if let callback {
-            if started { AudioDeviceStop(aggregate, callback) }
-            AudioDeviceDestroyIOProcID(aggregate, callback)
+            if started {
+                let stopStatus = AudioDeviceStop(aggregate, callback)
+                if stopStatus != noErr && stopStatus != kAudioHardwareBadDeviceError && stopStatus != kAudioHardwareBadObjectError {
+                    NSLog("DisplayVolume AudioDeviceStop returned %d", stopStatus)
+                }
+            }
+            let destroyStatus = AudioDeviceDestroyIOProcID(aggregate, callback)
+            if destroyStatus != noErr && destroyStatus != kAudioHardwareBadDeviceError && destroyStatus != kAudioHardwareBadObjectError {
+                NSLog("DisplayVolume AudioDeviceDestroyIOProcID returned %d; retaining GainState to prevent UAF", destroyStatus)
+                safeToDestroyGain = false
+            }
             self.callback = nil
         }
         started = false
+
         if aggregate != kAudioObjectUnknown {
-            AudioHardwareDestroyAggregateDevice(aggregate)
+            _ = AudioHardwareDestroyAggregateDevice(aggregate)
             aggregate = kAudioObjectUnknown
         }
         if tap != kAudioObjectUnknown {
-            AudioHardwareDestroyProcessTap(tap)
+            _ = AudioHardwareDestroyProcessTap(tap)
             tap = kAudioObjectUnknown
         }
-        if let gain { GainDestroy(gain) }
+        // Only destroy GainState if IOProc unregistration succeeded (or device/object was already gone);
+        // never override safeToDestroyGain after DestroyAggregateDevice to prevent UAF on live callbacks.
+        if let gain, safeToDestroyGain {
+            GainDestroy(gain)
+        }
         gain = nil
         tapDescription = nil
     }
 
-    private func installFormatListener(streamID: AudioStreamID) {
-        removeFormatListener()
-        outputStreamID = streamID
-        var prop = audioAddress(kAudioStreamPropertyVirtualFormat)
-        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            self?.onStreamFormatChanged?()
-        }
-        if AudioObjectAddPropertyListenerBlock(streamID, &prop, DispatchQueue.main, block) == noErr {
-            formatListenerBlock = block
+    private func installFormatListeners(inputStream: AudioStreamID, outputStream: AudioStreamID) {
+        removeFormatListeners()
+        let targets: [(AudioObjectID, AudioObjectPropertyAddress)] = [
+            (outputStream, audioAddress(kAudioStreamPropertyVirtualFormat)),
+            (inputStream, audioAddress(kAudioStreamPropertyVirtualFormat)),
+            (tap, audioAddress(kAudioTapPropertyFormat)),
+            (device.id, audioAddress(kAudioDevicePropertyNominalSampleRate))
+        ]
+        for (objID, addr) in targets where objID != kAudioObjectUnknown {
+            var prop = addr
+            let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+                self?.onStreamFormatChanged?()
+            }
+            if AudioObjectAddPropertyListenerBlock(objID, &prop, DispatchQueue.main, block) == noErr {
+                observedListeners.append((objID, prop, block))
+            }
         }
     }
 
-    private func removeFormatListener() {
-        if let block = formatListenerBlock, outputStreamID != kAudioObjectUnknown {
-            var prop = audioAddress(kAudioStreamPropertyVirtualFormat)
-            AudioObjectRemovePropertyListenerBlock(outputStreamID, &prop, DispatchQueue.main, block)
+    private func removeFormatListeners() {
+        for (objID, var prop, block) in observedListeners {
+            AudioObjectRemovePropertyListenerBlock(objID, &prop, DispatchQueue.main, block)
         }
-        formatListenerBlock = nil
-        outputStreamID = kAudioObjectUnknown
+        observedListeners.removeAll()
     }
 
     private static func audioProcessID() throws -> AudioObjectID {
@@ -160,7 +184,7 @@ final class AudioRoute {
         return result
     }
 
-    private func validateFormats() throws -> (sampleRate: Double, channels: UInt32, outputStream: AudioStreamID) {
+    private func validateFormats() throws -> (sampleRate: Double, channels: UInt32, inputStream: AudioStreamID, outputStream: AudioStreamID) {
         let inputStreams = try Self.streams(aggregate, scope: kAudioObjectPropertyScopeInput)
         let outputStreams = try Self.streams(aggregate, scope: kAudioObjectPropertyScopeOutput)
         guard inputStreams.count == 1, outputStreams.count == 1 else { throw Self.unsupportedFormat }
@@ -181,10 +205,10 @@ final class AudioRoute {
               capture.mSampleRate == outputFormat.mSampleRate else {
             throw Self.unsupportedFormat
         }
-        return (outputFormat.mSampleRate, outputFormat.mChannelsPerFrame, outputStreams[0])
+        return (outputFormat.mSampleRate, outputFormat.mChannelsPerFrame, inputStreams[0], outputStreams[0])
     }
 
-    private static var unsupportedFormat: AudioFailure {
+    static var unsupportedFormat: AudioFailure {
         AudioFailure(operation: L10n.text("匹配输出设备的 PCM 音频格式", "Match PCM output format"), status: kAudioDeviceUnsupportedFormatError)
     }
 
@@ -192,12 +216,16 @@ final class AudioRoute {
         var property = audioAddress(kAudioDevicePropertyStreams, scope: scope)
         var size: UInt32 = 0
         try checkAudio(AudioObjectGetPropertyDataSize(id, &property, 0, nil, &size), L10n.text("读取音频通道", "Read audio streams"))
-        guard size > 0 else { return [] }
-        var ids = [AudioStreamID](repeating: 0, count: Int(size) / MemoryLayout<AudioStreamID>.stride)
+        let stride = MemoryLayout<AudioStreamID>.stride
+        let capacity = Int(size) / stride
+        guard capacity > 0 else { return [] }
+        var ids = [AudioStreamID](repeating: kAudioObjectUnknown, count: capacity)
+        var actualSize = size
         try ids.withUnsafeMutableBytes { buffer in
-            try checkAudio(AudioObjectGetPropertyData(id, &property, 0, nil, &size, buffer.baseAddress!), L10n.text("读取音频通道", "Read audio streams"))
+            try checkAudio(AudioObjectGetPropertyData(id, &property, 0, nil, &actualSize, buffer.baseAddress!), L10n.text("读取音频通道", "Read audio streams"))
         }
-        return ids
+        let actualCount = min(capacity, Int(actualSize) / stride)
+        return Array(ids.prefix(actualCount)).filter { $0 != kAudioObjectUnknown }
     }
 
     private static func streamFormat(_ id: AudioStreamID) throws -> AudioStreamBasicDescription {

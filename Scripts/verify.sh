@@ -1,16 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# DisplayVolume First-Principles Anti-Regression & Quality Gate
-# Codifies recurring failure modes discovered during the Nov 2026 retrospective:
-#   1. Info.plist / EngineInfo.plist version drift
-#   2. Deprecated / non-existent CoreAudio SDK constants
-#   3. Unguarded @Published self-assignments causing idle CPU & hidden SwiftUI redraw storms
-#   4. Unthrottled UserDefaults disk writes in continuous drag hot paths
-#   5. OSD layer-clipping shadow artifact regressions
-#   6. Microphone capture stream calls that would trigger the macOS privacy dot or Bluetooth HFP downgrade
-#   7. Clean parallel build (-warnings-as-errors), unit tests, codesign, self-test, and HAL latency budgets
-
+# DisplayVolume First-Principles Anti-Regression & Security Gate
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT_DIR"
 
@@ -28,7 +19,7 @@ eng_build="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' EngineInfo.plis
 [[ "$app_build" == "$eng_build" ]] || fail "Build mismatch: Info.plist=$app_build vs EngineInfo.plist=$eng_build"
 echo "OK: Version $app_ver ($app_build) aligned across UI and Engine"
 
-echo "=== 2. Static Anti-Pattern Audit ==="
+echo "=== 2. Static Anti-Pattern & Security Audit ==="
 python3 - <<'PY'
 import pathlib, re, sys
 
@@ -36,57 +27,69 @@ root = pathlib.Path(".")
 errors = []
 
 audio_device = (root / "Sources/Shared/AudioDevice.swift").read_text()
-# Guard against macOS 13 deprecated or non-existent CoreAudio transport constants
 if re.search(r"\bkAudioDeviceTransportTypeContinuityCapture\b", audio_device):
-    errors.append("AudioDevice.swift uses deprecated kAudioDeviceTransportTypeContinuityCapture (use Wired/Wireless)")
+    errors.append("AudioDevice.swift uses deprecated kAudioDeviceTransportTypeContinuityCapture")
 if "kAudioDeviceTransportTypeSPDIF" in audio_device:
     errors.append("AudioDevice.swift references non-existent kAudioDeviceTransportTypeSPDIF")
-
-# Guard zero mic privacy dot & zero AirPods HFP downgrade invariant:
-# Hardware mic/output controls must never open AVAudioEngine / AudioQueue / AVCaptureSession streams.
 for forbidden in ("AVAudioEngine", "AVCaptureSession", "AudioQueueNewInput", "AVAudioRecorder"):
     if forbidden in audio_device:
         errors.append(f"AudioDevice.swift must not open capture streams ({forbidden}) — use HAL properties only")
+if "kAudioHardwarePropertyDefaultSystemOutputDevice" in audio_device:
+    errors.append("AudioDevice.swift must not silently mutate kAudioHardwarePropertyDefaultSystemOutputDevice")
 
-# Guard OSD shadow-clipping invariant (no rectangle shadow artifacts in macOS Tahoe Liquid Glass)
 osd = (root / "Sources/Engine/VolumeOSD.swift").read_text()
-for required in ("shadowInset", "container.wantsLayer = false", "p.hasShadow = false"):
+for required in ("shadowInset", "container.wantsLayer = false", "p.hasShadow = false", "presentationGeneration"):
     if required not in osd:
-        errors.append(f"VolumeOSD.swift missing anti-shadow-clipping invariant: `{required}`")
+        errors.append(f"VolumeOSD.swift missing required invariant: `{required}`")
 
-# Guard @Published diff-before-assign in DisplayVolumeApp.swift (prevents idle CPU / hidden SwiftUI redraws)
 app_swift = (root / "Sources/App/DisplayVolumeApp.swift").read_text()
-if "assignIfChanged(" not in app_swift:
-    errors.append("DisplayVolumeApp.swift must guard @Published updates with assignIfChanged()")
-if "StatusItemRenderKey" not in app_swift:
-    errors.append("DisplayVolumeApp.swift must guard MenuBarIconRenderer with StatusItemRenderKey")
-if "AudioDeviceCatalog.captureSnapshot()" not in app_swift:
-    errors.append("DisplayVolumeApp.swift must use single-pass AudioDeviceCatalog.captureSnapshot()")
+# Reject inout-@Published anti-pattern (Swift copy-in/copy-out triggers objectWillChange even when unchanged!)
+if "assignIfChanged(&" in app_swift:
+    errors.append("DisplayVolumeApp.swift must not pass @Published properties as inout (triggers phantom objectWillChange)")
+for required in ("StatusIconKey", "AudioDeviceCatalog.captureSnapshot()", "setCodeSigningRequirement", "InstallTransactionLock"):
+    if required not in app_swift:
+        errors.append(f"DisplayVolumeApp.swift missing required invariant: `{required}`")
 
-# Guard against calling MicrophoneControl.setVolume(...) inside setInputVolume drag hot path
 m_input = re.search(r"func setInputVolume\([^)]*\)\s*\{(.*?)\n    \}", app_swift, re.S)
 if not m_input:
     errors.append("Could not locate setInputVolume in DisplayVolumeApp.swift")
 else:
     body = m_input.group(1)
     if "MicrophoneControl.setVolume(" in body:
-        errors.append("setInputVolume must call MicrophoneControl.applyVolume(..., persistPreMute: !isDragging), not setVolume()")
+        errors.append("setInputVolume must not call MicrophoneControl.setVolume() on drag hot path")
     if "DispatchThrottleMath.shouldEmit" not in body:
-        errors.append("setInputVolume must throttle HAL writes during active drag")
+        errors.append("setInputVolume must throttle writes during active drag")
 
-# Guard slider external-value coordinator sync invariant (prevents dropped clicks after keyboard/preset change)
 components = (root / "Sources/App/VolumeComponents.swift").read_text()
-if "syncExternalValue(" not in components:
-    errors.append("VolumeComponents.swift must sync Coordinator.lastSentValue on external updateNSView updates")
+for required in ("syncExternalValue(", "invalidateSession("):
+    if required not in components:
+        errors.append(f"VolumeComponents.swift missing required invariant: `{required}`")
 
-# Guard engine watchdog silence stability & cached accessibility check
 engine = (root / "Sources/Engine/VolumeEngine.swift").read_text()
-if "isRunningSomewhere" not in engine:
-    errors.append("VolumeEngine.swift watchdog must check device.isRunningSomewhere during idle silence")
-if "cachedAccessibilityTrusted" not in engine:
-    errors.append("VolumeEngine.swift must cache Accessibility trust instead of calling AXIsProcessTrusted() on every drag tick")
+for required in ("setConnectionCodeSigningRequirement", "routeQueue", "isRunningSomewhere", "cachedAccessibilityTrusted", "screensSleeping"):
+    if required not in engine:
+        errors.append(f"VolumeEngine.swift missing required invariant: `{required}`")
+if "DistributedNotificationCenter.default().addObserver" in engine:
+    errors.append("VolumeEngine.swift must accept commands strictly via authenticated XPC, never DistributedNotificationCenter")
 
-# Guard Liquid Glass SDK compile-time portability (macOS 15 Xcode 16 vs macOS 26+ SDK)
+ota = (root / "Sources/Shared/OTAManifest.swift").read_text()
+for required in ("isValidSignature", "OTAArchiveSafety", "OTAInstallPreflight"):
+    if required not in ota:
+        errors.append(f"OTAManifest.swift missing security invariant: `{required}`")
+
+updater = (root / "Sources/App/AppUpdater.swift").read_text()
+if ".withoutDeletingBackupItem" not in updater or ".withoutDeletingBackupItem" not in app_swift:
+    errors.append("replaceItemAt must pass .withoutDeletingBackupItem so rollback backups actually exist")
+
+vol_model = (root / "Sources/Shared/VolumeModel.swift").read_text()
+if "anchor apple generic" not in vol_model:
+    errors.append("VolumeModel.swift XPC code signing requirement must pin `anchor apple generic`")
+
+build_ota = (root / "Scripts/build_ota.sh").read_text()
+if "--norsrc" not in build_ota:
+    errors.append("Scripts/build_ota.sh must use `ditto --norsrc` to prevent __MACOSX archive entries")
+
+# Guard Liquid Glass SDK compile-time portability
 for f in ("Sources/Engine/VolumeOSD.swift", "Sources/App/VolumeComponents.swift"):
     src = (root / f).read_text()
     if (".glassEffect(" in src or ".buttonStyle(.glass)" in src) and "#if LIQUID_GLASS_SDK" not in src:
@@ -96,7 +99,7 @@ if errors:
     for e in errors:
         print(f"FAIL: {e}", file=sys.stderr)
     sys.exit(1)
-print("OK: All 9 first-principles static anti-pattern guards passed")
+print("OK: All 16 first-principles static & security guards passed")
 PY
 
 echo "=== 3. Parallel Build, Unit Tests, Codesign & App Self-Test ==="

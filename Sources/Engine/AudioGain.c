@@ -13,6 +13,7 @@ struct GainState {
     atomic_bool sawSignal;
     atomic_bool layoutError;
     atomic_uint callbackCount;
+    atomic_uint renderedCallbackCount;
     unsigned expectedChannels;
     float gain;
     float step;
@@ -30,6 +31,7 @@ GainState *GainCreate(double sampleRate, unsigned expectedChannels) {
     atomic_init(&state->sawSignal, false);
     atomic_init(&state->layoutError, false);
     atomic_init(&state->callbackCount, 0);
+    atomic_init(&state->renderedCallbackCount, 0);
     state->expectedChannels = expectedChannels;
     state->rampLength = (unsigned)fmax(1.0, sampleRate * 0.010);
     return state;
@@ -40,59 +42,92 @@ void GainEnableOutput(GainState *state) { atomic_store(&state->outputEnabled, tr
 bool GainSawSignal(GainState *state) { return atomic_load(&state->sawSignal); }
 bool GainHasLayoutError(GainState *state) { return atomic_load(&state->layoutError); }
 unsigned GainCallbackCount(GainState *state) { return atomic_load(&state->callbackCount); }
+unsigned GainRenderedCallbackCount(GainState *state) { return atomic_load(&state->renderedCallbackCount); }
 
 void GainSetVolume(GainState *state, float fraction) {
     float volume = fminf(1.0f, fmaxf(0.0f, fraction));
     atomic_store(&state->target, (int)lroundf(volume * volume * 1000000.0f));
 }
 
+typedef enum {
+    DVLayoutValid = 0,
+    DVLayoutDisabled = 1,
+    DVLayoutInvalid = 2
+} DVLayoutStatus;
+
 typedef struct {
     const AudioBuffer *buffers[DV_MAX_CHANNELS];
     unsigned channels;
     unsigned frames;
     unsigned stride;
+    DVLayoutStatus status;
 } AudioLayout;
 
 static AudioLayout parseLayout(const AudioBufferList *list, unsigned expectedChannels) {
-    AudioLayout empty = {{0}, 0, 0, 0};
-    if (!list || list->mNumberBuffers == 0) return empty;
+    AudioLayout result = {{0}, 0, 0, 0, DVLayoutInvalid};
+    if (!list || list->mNumberBuffers == 0) {
+        result.status = DVLayoutDisabled;
+        return result;
+    }
     const AudioBuffer *buffers = list->mBuffers;
+
+    // Per Apple AudioDeviceIOProc contract, HAL legally sets mData == NULL or mDataByteSize == 0
+    // on disabled/inactive streams. Do NOT misclassify disabled streams as fatal layout errors.
+    bool allDisabled = true;
+    for (unsigned i = 0; i < list->mNumberBuffers; i++) {
+        if (buffers[i].mData != NULL && buffers[i].mDataByteSize > 0) {
+            allDisabled = false;
+            break;
+        }
+    }
+    if (allDisabled) {
+        result.status = DVLayoutDisabled;
+        return result;
+    }
 
     // Interleaved: 1 buffer containing `channels` interleaved Float32 channels.
     if (list->mNumberBuffers == 1) {
         unsigned ch = buffers[0].mNumberChannels;
-        if (ch == 0 || ch > DV_MAX_CHANNELS || ch != expectedChannels) return empty;
-        if (!buffers[0].mData) return empty;
+        if (ch == 0 || ch > DV_MAX_CHANNELS || ch != expectedChannels) return result;
+        if (!buffers[0].mData) return result;
         size_t frameBytes = (size_t)ch * sizeof(float);
-        if (buffers[0].mDataByteSize % frameBytes != 0) return empty;
-        AudioLayout layout = {{0}, ch, (unsigned)(buffers[0].mDataByteSize / frameBytes), ch};
-        for (unsigned c = 0; c < ch; c++) layout.buffers[c] = &buffers[0];
-        return layout;
+        if (buffers[0].mDataByteSize % frameBytes != 0) return result;
+        result.channels = ch;
+        result.frames = (unsigned)(buffers[0].mDataByteSize / frameBytes);
+        result.stride = ch;
+        result.status = DVLayoutValid;
+        for (unsigned c = 0; c < ch; c++) result.buffers[c] = &buffers[0];
+        return result;
     }
 
     // Planar: `channels` separate mono Float32 buffers of equal frame length.
     if (list->mNumberBuffers == expectedChannels && list->mNumberBuffers <= DV_MAX_CHANNELS) {
         unsigned ch = list->mNumberBuffers;
         unsigned refBytes = buffers[0].mDataByteSize;
-        if (refBytes % sizeof(float) != 0) return empty;
-        AudioLayout layout = {{0}, ch, (unsigned)(refBytes / sizeof(float)), 1};
+        if (refBytes % sizeof(float) != 0) return result;
         for (unsigned c = 0; c < ch; c++) {
             if (buffers[c].mNumberChannels != 1 || !buffers[c].mData || buffers[c].mDataByteSize != refBytes) {
-                return empty;
+                return result;
             }
-            layout.buffers[c] = &buffers[c];
+            result.buffers[c] = &buffers[c];
         }
-        return layout;
+        result.channels = ch;
+        result.frames = (unsigned)(refBytes / sizeof(float));
+        result.stride = 1;
+        result.status = DVLayoutValid;
+        return result;
     }
 
-    return empty;
+    return result;
 }
 
 static inline void zeroOutputBuffers(AudioBufferList *output) {
     if (!output) return;
     for (unsigned i = 0; i < output->mNumberBuffers; i++) {
         AudioBuffer *buffer = &output->mBuffers[i];
-        if (buffer->mData) memset(buffer->mData, 0, buffer->mDataByteSize);
+        if (buffer->mData && buffer->mDataByteSize > 0) {
+            memset(buffer->mData, 0, buffer->mDataByteSize);
+        }
     }
 }
 
@@ -112,12 +147,12 @@ static OSStatus render(
     AudioLayout source = parseLayout(input, state->expectedChannels);
     AudioLayout sink = parseLayout(output, state->expectedChannels);
 
-    if (!sink.frames || (input && input->mNumberBuffers && !source.stride)) {
+    if (sink.status == DVLayoutInvalid || source.status == DVLayoutInvalid) {
         zeroOutputBuffers(output);
-        atomic_store(&state->layoutError, true);
+        atomic_store_explicit(&state->layoutError, true, memory_order_release);
         return noErr;
     }
-    if (!source.frames) {
+    if (sink.status == DVLayoutDisabled || source.status == DVLayoutDisabled || !sink.frames || !source.frames) {
         zeroOutputBuffers(output);
         return noErr;
     }
@@ -133,7 +168,7 @@ static OSStatus render(
         outBases[c] = (float *)sink.buffers[c]->mData + (sink.stride > 1 ? c : 0);
     }
 
-    if (!atomic_load_explicit(&state->outputEnabled, memory_order_relaxed)) {
+    if (!atomic_load_explicit(&state->outputEnabled, memory_order_acquire)) {
         zeroOutputBuffers(output);
         if (atomic_load_explicit(&state->sawSignal, memory_order_relaxed)) return noErr;
         unsigned inStride = source.stride;
@@ -141,7 +176,7 @@ static OSStatus render(
             const float *inPtr = inBases[c];
             for (unsigned i = 0; i < frames; i++) {
                 if (fabsf(inPtr[i * inStride]) > 0.0001f) {
-                    atomic_store(&state->sawSignal, true);
+                    atomic_store_explicit(&state->sawSignal, true, memory_order_release);
                     return noErr;
                 }
             }
@@ -160,10 +195,10 @@ static OSStatus render(
     unsigned outStride = sink.stride;
 
     if (state->remaining == 0) {
-        // Steady-state fast path: zero unnecessary memset + SIMD auto-vectorizable loops.
         float g = state->gain;
         if (g == 0.0f) {
             zeroOutputBuffers(output);
+            atomic_fetch_add_explicit(&state->renderedCallbackCount, 1, memory_order_relaxed);
             return noErr;
         }
         if (inStride == 1 && outStride == 1) {
@@ -203,7 +238,6 @@ static OSStatus render(
         }
     }
 
-    // Only zero unmatched tail frames if sink is larger than source.
     if (sink.frames > frames) {
         for (unsigned c = 0; c < channels; c++) {
             float *outPtr = outBases[c];
@@ -212,6 +246,7 @@ static OSStatus render(
             }
         }
     }
+    atomic_fetch_add_explicit(&state->renderedCallbackCount, 1, memory_order_relaxed);
     return noErr;
 }
 
@@ -220,7 +255,7 @@ OSStatus GainInstallIOProc(AudioDeviceID device, GainState *state, AudioDeviceIO
 }
 
 bool GainSelfTest(void) {
-    // 1. Stereo interleaved -> planar probe, quadratic scaling, mute, and layout rejection
+    // 1. Stereo interleaved -> planar probe, quadratic scaling, mute, disabled stream (mData == NULL), and layout rejection
     GainState *state = GainCreate(100, 2);
     if (!state) return false;
     float input[] = {0.8f, -0.4f, -0.2f, 0.5f};
@@ -232,19 +267,26 @@ bool GainSelfTest(void) {
     AudioBufferList *destination = (AudioBufferList *)&sink;
 
     render(0, NULL, &source, NULL, destination, NULL, state);
-    bool probe = GainSawSignal(state) && left[0] == 0 && right[0] == 0;
+    bool probe = GainSawSignal(state) && left[0] == 0 && right[0] == 0 && GainRenderedCallbackCount(state) == 0;
 
     GainEnableOutput(state);
     GainSetVolume(state, 0.5f); // gain = 0.25
     render(0, NULL, &source, NULL, destination, NULL, state);
     bool scaled = fabsf(left[0] - 0.2f) < 0.000001f && fabsf(right[0] + 0.1f) < 0.000001f &&
         fabsf(left[1] + 0.05f) < 0.000001f && fabsf(right[1] - 0.125f) < 0.000001f &&
-        left[2] == 0 && right[2] == 0;
+        left[2] == 0 && right[2] == 0 && GainRenderedCallbackCount(state) == 1;
+
+    // Disabled HAL stream (mData == NULL) must silence output cleanly WITHOUT setting layoutError.
+    AudioBufferList disabledInput = {1, {{2, 0, NULL}}};
+    left[0] = 5.0f; right[0] = 5.0f;
+    render(0, NULL, &disabledInput, NULL, destination, NULL, state);
+    bool disabledOK = !GainHasLayoutError(state) && left[0] == 0.0f && right[0] == 0.0f && GainRenderedCallbackCount(state) == 1;
 
     GainSetVolume(state, 0.0f);
     render(0, NULL, &source, NULL, destination, NULL, state);
     bool muted = left[0] == 0 && right[0] == 0 && left[1] == 0 && right[1] == 0;
 
+    // Real channel mismatch must set layoutError and zero output.
     source.mBuffers[0].mNumberChannels = 1;
     render(0, NULL, &source, NULL, destination, NULL, state);
     bool rejected = GainHasLayoutError(state);
@@ -268,16 +310,14 @@ bool GainSelfTest(void) {
         && fabsf(qOut[12] - 1.0f) < 0.001f
         && fabsf(qOut[15] - 1.0f) < 0.001f;
 
-    // Second render hits steady-state (remaining == 0) interleaved fast path without prior memset.
     for (int i = 0; i < 16; i++) { qIn[i] = 0.6f; qOut[i] = -99.0f; }
     render(0, NULL, &qSrc, NULL, &qDst, NULL, quad);
     bool quadSteadyOK = fabsf(qOut[0] - 0.6f) < 0.001f && fabsf(qOut[15] - 0.6f) < 0.001f;
 
-    // Zero-gain steady-state silence path.
     GainSetVolume(quad, 0.0f);
-    render(0, NULL, &qSrc, NULL, &qDst, NULL, quad); // ramp down to 0
+    render(0, NULL, &qSrc, NULL, &qDst, NULL, quad);
     for (int i = 0; i < 16; i++) qOut[i] = 42.0f;
-    render(0, NULL, &qSrc, NULL, &qDst, NULL, quad); // steady-state g == 0
+    render(0, NULL, &qSrc, NULL, &qDst, NULL, quad);
     bool quadMuteOK = qOut[0] == 0.0f && qOut[15] == 0.0f;
     GainDestroy(quad);
 
@@ -302,5 +342,5 @@ bool GainSelfTest(void) {
         && pOutL[2] == 0.0f && pOutR[2] == 0.0f;
     GainDestroy(planar);
 
-    return probe && scaled && muted && rejected && quadRampOK && quadSteadyOK && quadMuteOK && planarSteadyTailOK;
+    return probe && scaled && disabledOK && muted && rejected && quadRampOK && quadSteadyOK && quadMuteOK && planarSteadyTailOK;
 }

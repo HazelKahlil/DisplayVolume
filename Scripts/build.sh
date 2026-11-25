@@ -24,7 +24,7 @@ fi
 cache_dir="$ROOT_DIR/build/.cache"
 mkdir -p "$cache_dir"
 
-# 1. Cached AppIcon.icns keyed by MakeIcon.swift SHA-256 (avoids 1.6s icon rebuild on every code edit)
+# 1. Cached AppIcon.icns keyed by MakeIcon.swift SHA-256
 icon_hash="$(shasum -a 256 Artwork/MakeIcon.swift | awk '{print $1}')"
 cached_icns="$cache_dir/AppIcon-${icon_hash}.icns"
 t_icon=$(python3 -c 'import time; print(f"{time.perf_counter():.3f}")')
@@ -69,10 +69,12 @@ xcrun --sdk macosx swiftc -sdk "$sdk" -target "$target" -O -warnings-as-errors \
   Sources/Shared/Localization.swift \
   Sources/Shared/AudioDevice.swift \
   Sources/Shared/VolumeModel.swift \
+  Sources/Shared/OTAManifest.swift \
   Sources/Engine/MediaKeyTap.swift \
   Tests/RunTests.swift \
   "$scratch/AudioGain.o" \
-  -framework AppKit -framework CoreAudio -framework ApplicationServices -framework IOKit \
+  -framework AppKit -framework CoreAudio -framework CryptoKit -framework Security \
+  -framework ApplicationServices -framework IOKit \
   -o "$scratch/RunTests" &
 pid_tests=$!
 
@@ -87,7 +89,7 @@ xcrun --sdk macosx swiftc -sdk "$sdk" -target "$target" -O -warnings-as-errors $
   Sources/Engine/VolumeOSD.swift \
   Sources/Engine/VolumeEngine.swift \
   "$scratch/AudioGain.o" \
-  -framework AppKit -framework SwiftUI -framework CoreAudio -framework Carbon \
+  -framework AppKit -framework SwiftUI -framework CoreAudio -framework Carbon -framework Security \
   -framework ApplicationServices -framework IOKit \
   -o "$engine_bundle/Contents/MacOS/DisplayVolumeEngine" &
 pid_engine=$!
@@ -96,13 +98,15 @@ xcrun --sdk macosx swiftc -sdk "$sdk" -target "$target" -O -warnings-as-errors $
   Sources/Shared/Localization.swift \
   Sources/Shared/AudioDevice.swift \
   Sources/Shared/VolumeModel.swift \
+  Sources/Shared/OTAManifest.swift \
   Sources/Engine/MediaKeyTap.swift \
+  Sources/App/AppUpdater.swift \
   Sources/App/MenuBarIconRenderer.swift \
   Sources/App/VolumeComponents.swift \
   Sources/App/PopoverView.swift \
   Sources/App/DisplayVolumeApp.swift \
-  -framework AppKit -framework SwiftUI -framework CoreAudio -framework CryptoKit \
-  -framework ServiceManagement -framework ApplicationServices -framework IOKit \
+  -framework AppKit -framework SwiftUI -framework CoreAudio -framework CryptoKit -framework Security \
+  -framework Combine -framework ServiceManagement -framework ApplicationServices -framework IOKit \
   -o "$app_bundle/Contents/MacOS/DisplayVolume" &
 pid_app=$!
 
@@ -119,15 +123,27 @@ echo "Parallel Swift compilation finished ($(elapsed_since "$t_swift"))"
 echo "Running unit tests..."
 "$scratch/RunTests"
 
-# Prefer Apple Development cert so macOS TCC permissions (Audio Capture & Accessibility) persist across updates.
-SIGN_ID=$(security find-identity -v -p codesigning 2>/dev/null | grep -m1 "Apple Development:" | sed -E 's/.*"([^"]+)".*/\1/' || true)
+# Select explicit Developer ID (with hardened runtime + timestamp), local Apple Development cert, or ad-hoc fallback.
+SIGN_ID="${DISPLAYVOLUME_SIGN_IDENTITY:-}"
+if [[ -z "$SIGN_ID" && "${DISPLAYVOLUME_ADHOC_SIGN:-0}" != "1" ]]; then
+  SIGN_ID=$(security find-identity -v -p codesigning 2>/dev/null | grep -m1 "Developer ID Application:" | sed -E 's/.*"([^"]+)".*/\1/' || true)
+fi
+if [[ -z "$SIGN_ID" && "${DISPLAYVOLUME_ADHOC_SIGN:-0}" != "1" ]]; then
+  SIGN_ID=$(security find-identity -v -p codesigning 2>/dev/null | grep -m1 "Apple Development:" | sed -E 's/.*"([^"]+)".*/\1/' || true)
+fi
+
+sign_extra_flags=()
+if [[ "$SIGN_ID" == Developer\ ID\ Application:* ]]; then
+  sign_extra_flags+=(--options runtime --timestamp)
+fi
+
 if [[ -n "${SIGN_ID:-}" && "${DISPLAYVOLUME_ADHOC_SIGN:-0}" != "1" ]]; then
   echo "Signing with identity: $SIGN_ID"
-  codesign --force --sign "$SIGN_ID" --identifier "com.hazelkahlil.DisplayVolume.Engine" "$engine_bundle"
+  codesign --force ${sign_extra_flags[@]+"${sign_extra_flags[@]}"} --sign "$SIGN_ID" --identifier "com.hazelkahlil.DisplayVolume.Engine" "$engine_bundle"
   cp -R "$engine_bundle" "$app_bundle/Contents/Helpers/DisplayVolumeEngine.app"
-  codesign --force --sign "$SIGN_ID" --identifier "com.hazelkahlil.DisplayVolume" "$app_bundle"
+  codesign --force ${sign_extra_flags[@]+"${sign_extra_flags[@]}"} --sign "$SIGN_ID" --identifier "com.hazelkahlil.DisplayVolume" "$app_bundle"
 else
-  echo "No Apple Development identity selected; using ad-hoc signature"
+  echo "No signing certificate selected; using ad-hoc signature"
   codesign --force --sign - --identifier "com.hazelkahlil.DisplayVolume.Engine" "$engine_bundle"
   cp -R "$engine_bundle" "$app_bundle/Contents/Helpers/DisplayVolumeEngine.app"
   codesign --force --sign - --identifier "com.hazelkahlil.DisplayVolume" "$app_bundle"

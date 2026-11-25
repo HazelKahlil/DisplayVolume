@@ -3,6 +3,7 @@ import SwiftUI
 
 struct PopoverView: View {
     @ObservedObject var model: VolumeController
+    @ObservedObject var updater: AppUpdater
     let onHideIcon: () -> Void
     let onQuitAll: () -> Void
     let sizeChanged: (CGSize) -> Void
@@ -10,7 +11,8 @@ struct PopoverView: View {
     @State private var showsSettings = false
     @State private var showsVirtualOutputs = false
     @State private var showsVirtualInputs = false
-    @State private var launchUIAtLogin = (SMAppService.mainApp.status == .enabled)
+    @State private var loginItemStatus = SMAppService.mainApp.status
+    @State private var loginItemError: String?
 
     private var physicalOutputs: [AudioDeviceInfo] {
         model.outputDevices.filter { $0.isPhysicalOutput || $0.uid == model.deviceUID }
@@ -30,6 +32,11 @@ struct PopoverView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
+            // 0. Compact OTA Update Banner (only shown when a verified newer version is available)
+            if case .available(let manifest) = updater.phase {
+                otaBanner(manifest: manifest)
+            }
+
             // 1. Primary Sound Output Control (Software on locked displays + Native hardware on built-in/AirPods)
             outputControlSection
 
@@ -79,8 +86,37 @@ struct PopoverView: View {
         .onAppear {
             model.refreshIfStale()
             model.refreshAccessibilityState()
-            launchUIAtLogin = (SMAppService.mainApp.status == .enabled)
+            loginItemStatus = SMAppService.mainApp.status
         }
+    }
+
+    // MARK: - 0. OTA Update Banner
+
+    private func otaBanner(manifest: OTAManifestPayload) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "arrow.down.circle.fill")
+                .font(.system(size: 13))
+                .foregroundStyle(.primary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(L10n.text("发现新版本 v\(manifest.version)", "Update Available: v\(manifest.version)"))
+                    .font(.system(size: 11.5, weight: .semibold))
+                Text(L10n.text("Ed25519 签名已验证", "Ed25519 signature verified"))
+                    .font(.system(size: 9.5))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 4)
+            GlassCapsuleButton(selected: true) {
+                updater.installAvailableUpdate(manifest) {
+                    model.isPlayingOnLockedDisplay
+                }
+            } label: {
+                Text(L10n.text("更新", "Update"))
+                    .font(.system(size: 10.5, weight: .semibold))
+            }
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 6)
+        .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
     // MARK: - 1. Output Sound & Ceiling Control
@@ -117,7 +153,7 @@ struct PopoverView: View {
                 VStack(alignment: .leading, spacing: 7) {
                     HStack(alignment: .top, spacing: 8) {
                         ProgressView().controlSize(.small).padding(.top, 1)
-                        Text(L10n.text("播放任意声音以完成首次系统音频授权，验证一次后即永久生效。", "Play any audio once to verify capture permission."))
+                        Text(L10n.text("播放任意非静音声音以验证系统音频捕获权限。", "Play any non-silent audio to verify system audio capture permission."))
                             .font(.system(size: 11))
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -135,7 +171,6 @@ struct PopoverView: View {
                     }
                 }
             } else if model.canControlCurrentOutput {
-                // Main native volume slider row (handles both software monitor & native hardware speakers)
                 HStack(spacing: 8) {
                     Button {
                         model.toggleActiveOutputMute()
@@ -153,6 +188,7 @@ struct PopoverView: View {
                         value: model.effectiveOutputMuted ? 0 : model.effectiveOutputVolume,
                         minValue: 0,
                         maxValue: model.effectiveOutputLimit,
+                        sessionKey: "out-\(model.deviceUID ?? "none")",
                         accessibilityTitle: L10n.text("输出音量", "Output Volume")
                     ) { pct, isTracking in
                         model.setActiveOutputVolume(pct, isDragging: isTracking)
@@ -170,7 +206,6 @@ struct PopoverView: View {
                     .help(L10n.text("调到上限 (\(model.effectiveOutputLimit)%)", "Set to \(model.effectiveOutputLimit)%"))
                 }
 
-                // Compact neutral presets
                 let limit = model.effectiveOutputLimit
                 HStack(spacing: 6) {
                     ForEach([25, 50, 75].filter { $0 < limit }, id: \.self) { preset in
@@ -193,7 +228,6 @@ struct PopoverView: View {
                     }
                 }
 
-                // Directly visible Safety Ceiling row (for locked external display software attenuation)
                 if model.isSoftwareOutputActive {
                     VStack(alignment: .leading, spacing: 3) {
                         HStack(alignment: .firstTextBaseline) {
@@ -219,6 +253,7 @@ struct PopoverView: View {
                             value: model.volumeLimit,
                             minValue: 1,
                             maxValue: 100,
+                            sessionKey: "cap-\(model.deviceUID ?? "none")",
                             accessibilityTitle: L10n.maxVolumeTitle
                         ) { cap, isTracking in
                             model.setVolumeLimit(max(1, cap), isDragging: isTracking)
@@ -331,8 +366,12 @@ struct PopoverView: View {
                     .font(.system(size: 13, weight: .semibold))
                 Spacer()
                 if model.currentInputDevice != nil {
-                    if model.inputMuted {
-                        Text(L10n.micMutedLabel)
+                    if !model.inputStatusReadable {
+                        Text(L10n.text("状态未知", "Unreadable"))
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
+                    } else if model.inputMuted {
+                        Text(model.inputUsesSoftMute ? L10n.text("增益归零", "Zero Gain") : L10n.micMutedLabel)
                             .font(.system(size: 12, weight: .semibold, design: .rounded))
                             .foregroundStyle(.secondary)
                     } else if model.inputVolumeWritable {
@@ -355,6 +394,7 @@ struct PopoverView: View {
                     .foregroundStyle(.secondary)
             } else if model.inputVolumeWritable || model.inputMuteSupported {
                 HStack(spacing: 8) {
+                    let shortcutSuffix = model.micHotkeyAvailable ? " (⌃⌥⇧ M)" : ""
                     Button {
                         model.toggleInputMute(showOSD: false)
                     } label: {
@@ -366,8 +406,8 @@ struct PopoverView: View {
                     .buttonStyle(.plain)
                     .disabled(!model.inputMuteSupported)
                     .help(model.inputMuted
-                        ? L10n.text("取消静音麦克风 (⌃⌥⇧ M)", "Unmute Microphone (⌃⌥⇧ M)")
-                        : L10n.text("静音麦克风 (⌃⌥⇧ M)", "Mute Microphone (⌃⌥⇧ M)"))
+                        ? L10n.text("取消静音麦克风\(shortcutSuffix)", "Unmute Microphone\(shortcutSuffix)")
+                        : L10n.text("静音麦克风\(shortcutSuffix)", "Mute Microphone\(shortcutSuffix)"))
                     .accessibilityLabel(model.inputMuted ? L10n.text("取消静音麦克风", "Unmute Microphone") : L10n.text("静音麦克风", "Mute Microphone"))
 
                     if model.inputVolumeWritable {
@@ -375,6 +415,7 @@ struct PopoverView: View {
                             value: model.shownInputVolume,
                             minValue: 0,
                             maxValue: 100,
+                            sessionKey: "in-\(model.currentInputDevice?.uid ?? "none")",
                             accessibilityTitle: L10n.text("麦克风音量", "Microphone Volume")
                         ) { pct, isTracking in
                             model.setInputVolume(pct, isDragging: isTracking)
@@ -441,9 +482,11 @@ struct PopoverView: View {
         if dev.transportKind.isVirtualOrAggregate {
             mode = L10n.virtualBadge
         } else if isCurrent && model.inputMuted {
-            mode = L10n.micMutedLabel
-        } else if dev.inputVolumeControlAvailable {
+            mode = model.inputUsesSoftMute ? L10n.text("增益归零", "Zero Gain") : L10n.micMutedLabel
+        } else if dev.inputMuteControlAvailable && dev.inputVolumeControlAvailable {
             mode = L10n.text("支持增益与静音", "Gain & Mute")
+        } else if dev.inputVolumeControlAvailable {
+            mode = L10n.text("支持增益调节", "Gain Control")
         } else if dev.inputMuteControlAvailable {
             mode = L10n.text("支持静音", "Mute Only")
         } else {
@@ -551,7 +594,7 @@ struct PopoverView: View {
         .buttonStyle(.plain)
     }
 
-    // MARK: - 5. Preferences Drawer
+    // MARK: - 5. Preferences & OTA Updates Drawer
 
     private var settingsSection: some View {
         VStack(alignment: .leading, spacing: 7) {
@@ -567,18 +610,40 @@ struct PopoverView: View {
                 get: { model.scrollOnIconEnabled },
                 set: { model.setScrollOnIcon($0) }
             ))
+            Toggle(L10n.text("自动检查 OTA 在线更新", "Automatically check for OTA updates"), isOn: $updater.autoCheckEnabled)
             Toggle(L10n.text("开机自动启动菜单栏界面", "Launch menu bar icon at login"), isOn: Binding(
-                get: { launchUIAtLogin },
+                get: { loginItemStatus == .enabled },
                 set: { wantOn in
+                    loginItemError = nil
                     do {
                         if wantOn { try SMAppService.mainApp.register() }
                         else { try SMAppService.mainApp.unregister() }
-                    } catch {}
-                    launchUIAtLogin = (SMAppService.mainApp.status == .enabled)
+                    } catch {
+                        loginItemError = error.localizedDescription
+                    }
+                    loginItemStatus = SMAppService.mainApp.status
                 }
             ))
 
-            Text(L10n.text("快捷键：F10–F12 · ⇧⌥ 微调 · ⌃⌥⇧ M 麦克风静音", "Keys: F10–F12 · ⇧⌥ Fine · ⌃⌥⇧ M Mic Mute"))
+            if loginItemStatus == .requiresApproval {
+                Text(L10n.text("请在「系统设置 → 通用 → 登录项」中批准桌面音量。", "Approve DisplayVolume in System Settings → Login Items."))
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            } else if let err = loginItemError {
+                Text(err)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+
+            Divider().opacity(0.28)
+
+            // OTA Update Status Row
+            otaSettingsRow
+
+            let micHint = model.micHotkeyAvailable
+                ? L10n.text(" · ⌃⌥⇧ M 麦克风静音", " · ⌃⌥⇧ M Mic Mute")
+                : L10n.text(" · ⌃⌥⇧ M 被占用", " · ⌃⌥⇧ M Unavailable")
+            Text(L10n.text("快捷键：F10–F12 · ⇧⌥ 微调\(micHint)", "Keys: F10–F12 · ⇧⌥ Fine\(micHint)"))
                 .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
                 .padding(.top, 1)
@@ -588,6 +653,72 @@ struct PopoverView: View {
         .font(.system(size: 11))
         .padding(9)
         .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    @ViewBuilder
+    private var otaSettingsRow: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Text("v\(updater.currentVersion) (\(updater.currentBuild))")
+                    .font(.system(size: 10.5, weight: .medium, design: .rounded).monospacedDigit())
+                    .foregroundStyle(.secondary)
+                Spacer()
+                switch updater.phase {
+                case .checking:
+                    ProgressView().controlSize(.mini)
+                case .downloading(let pct):
+                    Text(L10n.text("下载中 \(Int(pct * 100))%", "Downloading \(Int(pct * 100))%"))
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                case .verifying:
+                    Text(L10n.text("校验签名…", "Verifying…"))
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                case .installing:
+                    Text(L10n.text("正在重启更新…", "Installing…"))
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                case .available(let manifest):
+                    GlassCapsuleButton(selected: true) {
+                        updater.installAvailableUpdate(manifest) {
+                            model.isPlayingOnLockedDisplay
+                        }
+                    } label: {
+                        Text(L10n.text("安装 v\(manifest.version)", "Install v\(manifest.version)"))
+                            .font(.system(size: 10.5, weight: .semibold))
+                    }
+                default:
+                    GlassCapsuleButton {
+                        updater.checkForUpdates(userInitiated: true)
+                    } label: {
+                        Text(L10n.text("检查更新", "Check for Updates"))
+                            .font(.system(size: 10.5, weight: .medium))
+                    }
+                }
+            }
+
+            switch updater.phase {
+            case .upToDate:
+                Text(L10n.text("已是最新版本。", "You're up to date."))
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            case .failed(let msg):
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(msg)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button(L10n.text("前往 GitHub Releases 下载", "Open GitHub Releases")) {
+                        updater.openReleasesPage()
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.primary)
+                }
+            default:
+                EmptyView()
+            }
+        }
     }
 
     // MARK: - 6. Footer

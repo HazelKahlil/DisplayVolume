@@ -1,4 +1,5 @@
-#pragma once
+#ifndef DISPLAY_VOLUME_AUDIO_GAIN_H
+#define DISPLAY_VOLUME_AUDIO_GAIN_H
 
 #include <CoreAudio/CoreAudio.h>
 #include <stdbool.h>
@@ -12,5 +13,8 @@ void GainEnableOutput(GainState *state);
 bool GainSawSignal(GainState *state);
 bool GainHasLayoutError(GainState *state);
 unsigned GainCallbackCount(GainState *state);
+unsigned GainRenderedCallbackCount(GainState *state);
 OSStatus GainInstallIOProc(AudioDeviceID device, GainState *state, AudioDeviceIOProcID *id);
 bool GainSelfTest(void);
+
+#endif
