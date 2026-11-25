@@ -7,7 +7,8 @@
   </p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-v2.1.0-0ea5e9?style=flat-square" alt="v2.1.0" />
+    <img src="https://img.shields.io/badge/version-v2.2.0-0ea5e9?style=flat-square" alt="v2.2.0" />
+    <a href="https://github.com/HazelKahlil/DisplayVolume/actions/workflows/ci.yml"><img src="https://github.com/HazelKahlil/DisplayVolume/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
     <img src="https://img.shields.io/badge/platform-macOS%2014.4%2B-334155?style=flat-square&logo=apple&logoColor=white" alt="macOS 14.4+" />
     <img src="https://img.shields.io/badge/engine-CoreAudio%20Tap%20%2B%20HAL%20%2B%20C17-06b6d4?style=flat-square" alt="CoreAudio Tap + HAL + C17" />
     <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-64748b?style=flat-square" alt="MIT License" /></a>
@@ -60,9 +61,11 @@
 ```bash
 git clone https://github.com/HazelKahlil/DisplayVolume.git
 cd DisplayVolume
-./Scripts/build.sh --install
+./Scripts/verify.sh --install
 open ~/Applications/DisplayVolume.app
 ```
+
+> 项目工程规范、防回归自动化门禁、项目专属 Skill 与第一性原理复盘报告详见 [`AGENTS.md`](./AGENTS.md)、[`Scripts/verify.sh`](./Scripts/verify.sh)、[`.agents/skills/displayvolume-engineering/SKILL.md`](./.agents/skills/displayvolume-engineering/SKILL.md) 与 [`docs/RETROSPECTIVE-2026-11.md`](./docs/RETROSPECTIVE-2026-11.md)。
 
 打包可拖拽安装的 `.dmg`：
 

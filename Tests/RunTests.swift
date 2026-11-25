@@ -149,6 +149,30 @@ struct DisplayVolumeTests {
         let decoded = try! JSONDecoder().decode(VolumeState.self, from: encoded)
         check(decoded == sampleState, "VolumeState JSON round-trip")
 
+        // 7. Drag throttle & single-pass HAL snapshot invariants
+        check(
+            !DispatchThrottleMath.shouldEmit(now: 1.010, lastSentAt: 1.000, minInterval: 0.020, isDragging: true),
+            "Active drag throttles rapid HAL/IPC writes below minInterval"
+        )
+        check(
+            DispatchThrottleMath.shouldEmit(now: 1.025, lastSentAt: 1.000, minInterval: 0.020, isDragging: true),
+            "Active drag emits once minInterval has elapsed"
+        )
+        check(
+            DispatchThrottleMath.shouldEmit(now: 1.001, lastSentAt: 1.000, minInterval: 0.020, isDragging: false),
+            "Drag release / discrete click always flushes final value immediately"
+        )
+
+        let snap = AudioDeviceCatalog.captureSnapshot()
+        check(snap.outputDevices.allSatisfy { $0.outputChannels > 0 && !$0.isHidden }, "Snapshot outputs are visible output devices")
+        check(snap.inputDevices.allSatisfy { $0.inputChannels > 0 && !$0.isHidden }, "Snapshot inputs are visible input devices")
+        if let defOut = snap.defaultOutput {
+            check(defOut.outputChannels > 0, "Snapshot defaultOutput has output channels")
+        }
+        if let defIn = snap.defaultInput {
+            check(defIn.inputChannels > 0, "Snapshot defaultInput has input channels")
+        }
+
         print("ALL DISPLAYVOLUME UNIT TESTS PASSED")
     }
 }

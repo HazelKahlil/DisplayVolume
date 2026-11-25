@@ -77,7 +77,7 @@ struct PopoverView: View {
         .fixedSize()
         .onGeometryChange(for: CGSize.self, of: { $0.size }, action: sizeChanged)
         .onAppear {
-            model.refreshAllAudioDevices()
+            model.refreshIfStale()
             model.refreshAccessibilityState()
             launchUIAtLogin = (SMAppService.mainApp.status == .enabled)
         }

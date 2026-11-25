@@ -116,6 +116,7 @@ private struct VolumeOSDView: View {
 
 private struct OSDLiquidGlassModifier: ViewModifier {
     func body(content: Content) -> some View {
+        #if LIQUID_GLASS_SDK
         if #available(macOS 26.0, *) {
             content
                 .glassEffect(.regular, in: Capsule())
@@ -126,6 +127,12 @@ private struct OSDLiquidGlassModifier: ViewModifier {
                 .overlay(Capsule().strokeBorder(Color.primary.opacity(0.14), lineWidth: 0.75))
                 .shadow(color: .black.opacity(0.16), radius: 12, y: 4)
         }
+        #else
+        content
+            .background(.regularMaterial, in: Capsule())
+            .overlay(Capsule().strokeBorder(Color.primary.opacity(0.14), lineWidth: 0.75))
+            .shadow(color: .black.opacity(0.16), radius: 12, y: 4)
+        #endif
     }
 }
 

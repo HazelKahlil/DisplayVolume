@@ -4,6 +4,14 @@ import CryptoKit
 import OSLog
 import SwiftUI
 
+@inline(__always)
+@discardableResult
+private func assignIfChanged<T: Equatable>(_ target: inout T, _ newValue: T) -> Bool {
+    guard target != newValue else { return false }
+    target = newValue
+    return true
+}
+
 @MainActor
 final class VolumeController: NSObject, ObservableObject {
     @Published private(set) var state = VolumeIPC.read()
@@ -39,9 +47,14 @@ final class VolumeController: NSObject, ObservableObject {
     private var isDraggingInput = false
     private var lastVolumeIPCSentAt: TimeInterval = 0
     private var lastLimitIPCSentAt: TimeInterval = 0
+    private var lastNativeOutHALSentAt: TimeInterval = 0
+    private var lastInputHALSentAt: TimeInterval = 0
+    private var lastFullRefreshAt: TimeInterval = 0
+    private var lastStateFileModDate: Date?
 
     private var heartbeat: Timer?
     private var axPollTimer: Timer?
+    private var deviceListDebounceWorkItem: DispatchWorkItem?
     private var scrollAccumulator: CGFloat = 0
 
     // CoreAudio HAL listeners for zero-latency sync with macOS System Settings & Control Center
@@ -117,13 +130,14 @@ final class VolumeController: NSObject, ObservableObject {
             object: nil,
             suspensionBehavior: .deliverImmediately
         )
-        let timer = Timer(timeInterval: 5.0, target: self, selector: #selector(pollFallback), userInfo: nil, repeats: true)
-        timer.tolerance = 1.5
+        // Event-driven listeners handle real-time sync; keep a low-cost 30s safety heartbeat.
+        let timer = Timer(timeInterval: 30.0, target: self, selector: #selector(pollFallback), userInfo: nil, repeats: true)
+        timer.tolerance = 5.0
         RunLoop.main.add(timer, forMode: .common)
         heartbeat = timer
 
         installSystemAudioListeners()
-        refreshAllAudioDevices()
+        refreshAllAudioDevices(force: true)
         syncUIMediaKeyTap()
     }
 
@@ -132,6 +146,8 @@ final class VolumeController: NSObject, ObservableObject {
         heartbeat = nil
         axPollTimer?.invalidate()
         axPollTimer = nil
+        deviceListDebounceWorkItem?.cancel()
+        deviceListDebounceWorkItem = nil
         removeSystemAudioListeners()
         if uiMediaKeyTap.isRunning {
             VolumeIPC.send(.setUIMediaKeysActive, flag: false)
@@ -142,90 +158,138 @@ final class VolumeController: NSObject, ObservableObject {
 
     // MARK: - Device & Hardware Sync
 
-    func refreshAllAudioDevices() {
-        refreshOutputDevices()
-        refreshInputDevices()
+    func refreshIfStale(maxAge: TimeInterval = 0.12) {
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - lastFullRefreshAt >= maxAge {
+            refreshAllAudioDevices(force: true)
+        }
+    }
+
+    /// Single-pass CoreAudio HAL snapshot refresh: enumerates all devices once instead of 4x per popover open.
+    func refreshAllAudioDevices(force: Bool = true) {
+        let now = ProcessInfo.processInfo.systemUptime
+        if !force, now - lastFullRefreshAt < 0.12 { return }
+        lastFullRefreshAt = now
+
+        let snapshot = AudioDeviceCatalog.captureSnapshot()
+        var changed = false
+        changed = assignIfChanged(&outputDevices, snapshot.outputDevices) || changed
+        changed = assignIfChanged(&currentOutputDevice, snapshot.defaultOutput) || changed
+        changed = assignIfChanged(&inputDevices, snapshot.inputDevices) || changed
+        changed = assignIfChanged(&currentInputDevice, snapshot.defaultInput) || changed
+
+        installNativeOutputListeners(for: snapshot.defaultOutput)
+        installInputListeners(for: snapshot.defaultInput)
+        changed = syncNativeOutputHardwareState(force: false) || changed
+        changed = syncInputHardwareState(force: false) || changed
+        if changed {
+            onChange?()
+        }
     }
 
     func refreshOutputDevices() {
-        outputDevices = OutputDeviceCatalog.allOutputDevices()
-        currentOutputDevice = OutputDeviceCatalog.currentDefault()
+        var changed = false
+        changed = assignIfChanged(&outputDevices, OutputDeviceCatalog.allOutputDevices()) || changed
+        changed = assignIfChanged(&currentOutputDevice, OutputDeviceCatalog.currentDefault()) || changed
         installNativeOutputListeners(for: currentOutputDevice)
-        syncNativeOutputHardwareState(force: false)
-        onChange?()
+        changed = syncNativeOutputHardwareState(force: false) || changed
+        if changed {
+            onChange?()
+        }
     }
 
     func refreshInputDevices() {
-        inputDevices = InputDeviceCatalog.allInputDevices()
-        currentInputDevice = InputDeviceCatalog.currentDefault()
+        var changed = false
+        changed = assignIfChanged(&inputDevices, InputDeviceCatalog.allInputDevices()) || changed
+        changed = assignIfChanged(&currentInputDevice, InputDeviceCatalog.currentDefault()) || changed
         installInputListeners(for: currentInputDevice)
-        syncInputHardwareState(force: false)
-        onChange?()
+        changed = syncInputHardwareState(force: false) || changed
+        if changed {
+            onChange?()
+        }
     }
 
     func refreshAccessibilityState() {
         let trusted = MediaKeyTap.isAccessibilityTrusted
-        if trusted != uiAccessibilityTrusted {
-            uiAccessibilityTrusted = trusted
+        if assignIfChanged(&uiAccessibilityTrusted, trusted) {
             onChange?()
         }
         syncUIMediaKeyTap()
     }
 
     func selectOutputDevice(uid: String) {
-        if OutputDeviceCatalog.setDefaultOutput(uid: uid) {
+        let switched: Bool
+        if let cached = outputDevices.first(where: { $0.uid == uid }) {
+            switched = OutputDeviceCatalog.setDefaultOutput(deviceID: cached.id)
+        } else {
+            switched = OutputDeviceCatalog.setDefaultOutput(uid: uid)
+        }
+        if switched {
             nativeOutLockUntil = 0
             refreshOutputDevices()
         }
     }
 
     func selectInputDevice(uid: String) {
-        if InputDeviceCatalog.setDefaultInput(uid: uid) {
+        let switched: Bool
+        if let cached = inputDevices.first(where: { $0.uid == uid }) {
+            switched = InputDeviceCatalog.setDefaultInput(deviceID: cached.id)
+        } else {
+            switched = InputDeviceCatalog.setDefaultInput(uid: uid)
+        }
+        if switched {
             inputLockUntil = 0
             refreshInputDevices()
         }
     }
 
-    private func syncNativeOutputHardwareState(force: Bool) {
-        guard let dev = currentOutputDevice, dev.volumeControlAvailable else { return }
+    @discardableResult
+    private func syncNativeOutputHardwareState(force: Bool) -> Bool {
+        guard let dev = currentOutputDevice, dev.volumeControlAvailable else { return false }
         let now = ProcessInfo.processInfo.systemUptime
-        guard force || (!isDraggingNativeOut && now >= nativeOutLockUntil) else { return }
+        guard force || (!isDraggingNativeOut && now >= nativeOutLockUntil) else { return false }
 
+        var changed = false
         if let scalar = AudioHardwareControl.readScalarVolume(
             deviceID: dev.id,
             scope: kAudioDevicePropertyScopeOutput,
             channelCount: dev.outputChannels
         ) {
-            nativeOutputVolume = Int((scalar * 100.0).rounded())
+            changed = assignIfChanged(&nativeOutputVolume, Int((scalar * 100.0).rounded())) || changed
         }
         if let hwMuted = AudioHardwareControl.readMute(
             deviceID: dev.id,
             scope: kAudioDevicePropertyScopeOutput,
             channelCount: dev.outputChannels
         ) {
-            nativeOutputMuted = hwMuted
+            changed = assignIfChanged(&nativeOutputMuted, hwMuted) || changed
         } else {
-            nativeOutputMuted = (nativeOutputVolume == 0)
+            changed = assignIfChanged(&nativeOutputMuted, nativeOutputVolume == 0) || changed
         }
+        return changed
     }
 
-    private func syncInputHardwareState(force: Bool) {
+    @discardableResult
+    private func syncInputHardwareState(force: Bool) -> Bool {
         guard let mic = currentInputDevice else {
-            inputVolume = 0
-            inputMuted = false
-            inputVolumeWritable = false
-            inputMuteSupported = false
-            inputUsesSoftMute = false
-            return
+            var changed = false
+            changed = assignIfChanged(&inputVolume, 0) || changed
+            changed = assignIfChanged(&inputMuted, false) || changed
+            changed = assignIfChanged(&inputVolumeWritable, false) || changed
+            changed = assignIfChanged(&inputMuteSupported, false) || changed
+            changed = assignIfChanged(&inputUsesSoftMute, false) || changed
+            return changed
         }
         let now = ProcessInfo.processInfo.systemUptime
         let status = MicrophoneControl.readStatus(for: mic)
-        inputVolumeWritable = status.volumeWritable
-        inputMuteSupported = status.muteSupported
-        inputUsesSoftMute = status.usesSoftMute
-        guard force || (!isDraggingInput && now >= inputLockUntil) else { return }
-        inputVolume = status.volumePercent
-        inputMuted = status.muted
+        var changed = false
+        changed = assignIfChanged(&inputVolumeWritable, status.volumeWritable) || changed
+        changed = assignIfChanged(&inputMuteSupported, status.muteSupported) || changed
+        changed = assignIfChanged(&inputUsesSoftMute, status.usesSoftMute) || changed
+        guard force || (!isDraggingInput && now >= inputLockUntil) else { return changed }
+        changed = assignIfChanged(&inputVolume, status.volumePercent) || changed
+        changed = assignIfChanged(&inputMuted, status.muted) || changed
+        return changed
     }
 
     // MARK: - CoreAudio Property Listeners
@@ -252,11 +316,21 @@ final class VolumeController: NSObject, ObservableObject {
 
         var devAddr = audioAddress(kAudioHardwarePropertyDevices)
         let devBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            Task { @MainActor in self?.refreshAllAudioDevices() }
+            Task { @MainActor in self?.scheduleDeviceTopologyRefresh() }
         }
         if AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &devAddr, DispatchQueue.main, devBlock) == noErr {
             systemDevicesBlock = devBlock
         }
+    }
+
+    private func scheduleDeviceTopologyRefresh() {
+        deviceListDebounceWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.deviceListDebounceWorkItem = nil
+            self?.refreshAllAudioDevices(force: true)
+        }
+        deviceListDebounceWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06, execute: work)
     }
 
     private func removeSystemAudioListeners() {
@@ -293,8 +367,9 @@ final class VolumeController: NSObject, ObservableObject {
                 guard AudioObjectHasProperty(targetID, &prop) else { continue }
                 let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
                     Task { @MainActor in
-                        self?.syncNativeOutputHardwareState(force: false)
-                        self?.onChange?()
+                        if self?.syncNativeOutputHardwareState(force: false) == true {
+                            self?.onChange?()
+                        }
                     }
                 }
                 if AudioObjectAddPropertyListenerBlock(targetID, &prop, DispatchQueue.main, block) == noErr {
@@ -327,8 +402,9 @@ final class VolumeController: NSObject, ObservableObject {
                 guard AudioObjectHasProperty(targetID, &prop) else { continue }
                 let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
                     Task { @MainActor in
-                        self?.syncInputHardwareState(force: false)
-                        self?.onChange?()
+                        if self?.syncInputHardwareState(force: false) == true {
+                            self?.onChange?()
+                        }
                     }
                 }
                 if AudioObjectAddPropertyListenerBlock(targetID, &prop, DispatchQueue.main, block) == noErr {
@@ -362,15 +438,14 @@ final class VolumeController: NSObject, ObservableObject {
             || latest?.lastTriggerSource == .scroll
 
         if externalHardwareTrigger || (!isDraggingVolume && now >= volumeLockUntil) {
-            optimisticVolume = nil
-            optimisticMuted = nil
+            assignIfChanged(&optimisticVolume, nil)
+            assignIfChanged(&optimisticMuted, nil)
         }
         if !isDraggingLimit && now >= limitLockUntil {
-            optimisticLimit = nil
+            assignIfChanged(&optimisticLimit, nil)
         }
 
-        if state != latest {
-            state = latest
+        if assignIfChanged(&state, latest) {
             syncUIMediaKeyTap()
             if uiMediaKeyTap.isRunning, latest?.mediaKeysActive == false {
                 VolumeIPC.send(.setUIMediaKeysActive, flag: true)
@@ -380,19 +455,28 @@ final class VolumeController: NSObject, ObservableObject {
     }
 
     func refreshFromDisk() {
+        lastStateFileModDate = (try? FileManager.default.attributesOfItem(atPath: VolumeIPC.stateFile.path)[.modificationDate]) as? Date
         applyIncomingState(VolumeIPC.read())
     }
 
     @objc private func pollFallback() {
-        refreshFromDisk()
-        refreshAccessibilityState()
+        // Fast-path: skip disk I/O and JSON decoding when engine PID is alive and state.json mtime is unchanged.
+        let currentMod = (try? FileManager.default.attributesOfItem(atPath: VolumeIPC.stateFile.path)[.modificationDate]) as? Date
+        let engineAlive = (state?.enginePID ?? 0) > 0 && kill(state!.enginePID, 0) == 0
+        if !engineAlive || currentMod == nil || currentMod != lastStateFileModDate {
+            lastStateFileModDate = currentMod
+            applyIncomingState(VolumeIPC.read())
+        }
+        if !uiAccessibilityTrusted {
+            refreshAccessibilityState()
+        }
     }
 
     // MARK: - Media Keys & Scroll
 
     private func syncUIMediaKeyTap() {
         let trusted = MediaKeyTap.isAccessibilityTrusted
-        uiAccessibilityTrusted = trusted
+        assignIfChanged(&uiAccessibilityTrusted, trusted)
         if trusted {
             axPollTimer?.invalidate()
             axPollTimer = nil
@@ -487,14 +571,14 @@ final class VolumeController: NSObject, ObservableObject {
         isDraggingVolume = isDragging
         volumeLockUntil = now + 0.30
         if clamped > 0 {
-            optimisticVolume = clamped
-            optimisticMuted = false
+            assignIfChanged(&optimisticVolume, clamped)
+            assignIfChanged(&optimisticMuted, false)
         } else {
-            optimisticMuted = true
+            assignIfChanged(&optimisticMuted, true)
         }
         onChange?()
 
-        if !isDragging || (now - lastVolumeIPCSentAt) >= 0.025 {
+        if DispatchThrottleMath.shouldEmit(now: now, lastSentAt: lastVolumeIPCSentAt, minInterval: 0.025, isDragging: isDragging) {
             lastVolumeIPCSentAt = now
             VolumeIPC.send(.volume, value: clamped, source: .slider)
         }
@@ -505,13 +589,13 @@ final class VolumeController: NSObject, ObservableObject {
         let now = ProcessInfo.processInfo.systemUptime
         isDraggingLimit = isDragging
         limitLockUntil = now + 0.30
-        optimisticLimit = clamped
+        assignIfChanged(&optimisticLimit, clamped)
         if let v = optimisticVolume, v > clamped {
-            optimisticVolume = clamped
+            assignIfChanged(&optimisticVolume, clamped)
         }
         onChange?()
 
-        if !isDragging || (now - lastLimitIPCSentAt) >= 0.025 {
+        if DispatchThrottleMath.shouldEmit(now: now, lastSentAt: lastLimitIPCSentAt, minInterval: 0.025, isDragging: isDragging) {
             lastLimitIPCSentAt = now
             VolumeIPC.send(.limit, value: clamped)
         }
@@ -520,7 +604,7 @@ final class VolumeController: NSObject, ObservableObject {
     func toggleMute() {
         let now = ProcessInfo.processInfo.systemUptime
         volumeLockUntil = now + 0.25
-        optimisticMuted = !muted
+        assignIfChanged(&optimisticMuted, !muted)
         onChange?()
         VolumeIPC.send(.mute, source: .slider)
     }
@@ -531,22 +615,25 @@ final class VolumeController: NSObject, ObservableObject {
         let now = ProcessInfo.processInfo.systemUptime
         isDraggingNativeOut = isDragging
         nativeOutLockUntil = now + 0.25
-        nativeOutputVolume = clamped
-        nativeOutputMuted = (clamped == 0)
+        assignIfChanged(&nativeOutputVolume, clamped)
+        assignIfChanged(&nativeOutputMuted, clamped == 0)
 
-        _ = AudioHardwareControl.writeScalarVolume(
-            deviceID: dev.id,
-            scope: kAudioDevicePropertyScopeOutput,
-            channelCount: dev.outputChannels,
-            fraction: Float(clamped) / 100.0
-        )
-        if dev.muteControlAvailable {
-            _ = AudioHardwareControl.writeMute(
+        if DispatchThrottleMath.shouldEmit(now: now, lastSentAt: lastNativeOutHALSentAt, minInterval: 0.020, isDragging: isDragging) {
+            lastNativeOutHALSentAt = now
+            _ = AudioHardwareControl.writeScalarVolume(
                 deviceID: dev.id,
                 scope: kAudioDevicePropertyScopeOutput,
                 channelCount: dev.outputChannels,
-                muted: clamped == 0
+                fraction: Float(clamped) / 100.0
             )
+            if dev.muteControlAvailable {
+                _ = AudioHardwareControl.writeMute(
+                    deviceID: dev.id,
+                    scope: kAudioDevicePropertyScopeOutput,
+                    channelCount: dev.outputChannels,
+                    muted: clamped == 0
+                )
+            }
         }
         onChange?()
     }
@@ -556,7 +643,7 @@ final class VolumeController: NSObject, ObservableObject {
         let now = ProcessInfo.processInfo.systemUptime
         nativeOutLockUntil = now + 0.25
         let targetMuted = !nativeOutputMuted
-        nativeOutputMuted = targetMuted
+        assignIfChanged(&nativeOutputMuted, targetMuted)
 
         if dev.muteControlAvailable {
             _ = AudioHardwareControl.writeMute(
@@ -566,7 +653,7 @@ final class VolumeController: NSObject, ObservableObject {
                 muted: targetMuted
             )
             if !targetMuted && nativeOutputVolume == 0 {
-                nativeOutputVolume = 25
+                assignIfChanged(&nativeOutputVolume, 25)
                 _ = AudioHardwareControl.writeScalarVolume(
                     deviceID: dev.id,
                     scope: kAudioDevicePropertyScopeOutput,
@@ -595,16 +682,20 @@ final class VolumeController: NSObject, ObservableObject {
         isDraggingInput = isDragging
         inputLockUntil = now + 0.25
         if clamped > 0 {
-            inputVolume = clamped
-            inputMuted = false
+            assignIfChanged(&inputVolume, clamped)
+            assignIfChanged(&inputMuted, false)
         } else {
-            inputVolume = clamped
+            assignIfChanged(&inputVolume, clamped)
             if !mic.inputMuteControlAvailable {
-                inputMuted = true
+                assignIfChanged(&inputMuted, true)
             }
         }
 
-        _ = MicrophoneControl.setVolume(clamped, for: mic)
+        if DispatchThrottleMath.shouldEmit(now: now, lastSentAt: lastInputHALSentAt, minInterval: 0.020, isDragging: isDragging) {
+            lastInputHALSentAt = now
+            // Never write UserDefaults plist to disk on every pixel drag; persist only on drag end / discrete change.
+            MicrophoneControl.applyVolume(clamped, for: mic, persistPreMute: !isDragging)
+        }
         onChange?()
     }
 
@@ -613,8 +704,8 @@ final class VolumeController: NSObject, ObservableObject {
         let now = ProcessInfo.processInfo.systemUptime
         inputLockUntil = now + 0.25
         if let updated = MicrophoneControl.toggleMute(for: mic) {
-            inputVolume = updated.volumePercent
-            inputMuted = updated.muted
+            assignIfChanged(&inputVolume, updated.volumePercent)
+            assignIfChanged(&inputMuted, updated.muted)
             if showOSD {
                 VolumeIPC.send(.showMicOSD)
             }
@@ -771,16 +862,29 @@ enum EngineProvisioner {
 @main
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
+    private struct StatusItemRenderKey: Equatable {
+        let volume: Int
+        let muted: Bool
+        let active: Bool
+        let showPercent: Bool
+        let inputMuted: Bool
+    }
+
     private let model = VolumeController()
     private let log = Logger(subsystem: VolumeIPC.suiteName, category: "DisplayVolumeUI")
     private let popover = NSPopover()
     private var statusItem: NSStatusItem?
+    private var lastStatusRenderKey: StatusItemRenderKey?
     private var scrollMonitor: Any?
     private var sleepObserver: NSObjectProtocol?
 
     static func main() {
         if CommandLine.arguments.contains("--self-test") {
             runSelfTestSuite()
+            return
+        }
+        if CommandLine.arguments.contains("--bench") {
+            runLatencyBenchmark()
             return
         }
         if CommandLine.arguments.contains("--engine-status") {
@@ -795,10 +899,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
         if CommandLine.arguments.contains("--diagnose") {
-            let outputs = OutputDeviceCatalog.allOutputDevices()
-            let currentOut = OutputDeviceCatalog.currentDefault()
-            let inputs = InputDeviceCatalog.allInputDevices()
-            let currentIn = InputDeviceCatalog.currentDefault()
+            let snapshot = AudioDeviceCatalog.captureSnapshot()
+            let outputs = snapshot.outputDevices
+            let currentOut = snapshot.defaultOutput
+            let inputs = snapshot.inputDevices
+            let currentIn = snapshot.defaultInput
 
             print("Default output: \(currentOut?.name ?? "None") (\(currentOut?.transportKind.displayLabel ?? "-"))")
             print("  Native scalar volume: \(currentOut?.volumeControlAvailable ?? false), mute: \(currentOut?.muteControlAvailable ?? false)")
@@ -831,7 +936,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         terminateDuplicateUIInstances()
-        EngineProvisioner.ensureInstalledAndRunning()
 
         popover.behavior = .transient
         popover.animates = true
@@ -861,6 +965,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         model.beginMonitoring()
         model.refreshFromDisk()
         updateStatusItemAppearance()
+
+        // Provision / update embedded LaunchAgent engine off the main thread so menu bar icon appears immediately.
+        DispatchQueue.global(qos: .userInitiated).async {
+            EngineProvisioner.ensureInstalledAndRunning()
+            DispatchQueue.main.async { [weak self] in
+                self?.model.refreshFromDisk()
+            }
+        }
 
         installScrollMonitor()
 
@@ -1024,22 +1136,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func updateStatusItemAppearance() {
         guard let button = statusItem?.button else { return }
         let outActive = model.canControlCurrentOutput
+        let renderKey = StatusItemRenderKey(
+            volume: model.effectiveOutputVolume,
+            muted: model.effectiveOutputMuted,
+            active: outActive,
+            showPercent: model.showMenuBarPercent,
+            inputMuted: model.inputMuted
+        )
+        guard renderKey != lastStatusRenderKey else { return }
+        lastStatusRenderKey = renderKey
+
         let baseLabel = outActive
-            ? (model.effectiveOutputMuted ? L10n.mutedLabel : "\(L10n.appName) \(model.effectiveOutputVolume)%")
+            ? (renderKey.muted ? L10n.mutedLabel : "\(L10n.appName) \(renderKey.volume)%")
             : L10n.appName
-        let fullLabel = model.inputMuted
+        let fullLabel = renderKey.inputMuted
             ? "\(baseLabel) · \(L10n.micMutedOSDLabel)"
             : baseLabel
 
         let image = MenuBarIconRenderer.makeIcon(
-            volume: model.effectiveOutputVolume,
-            muted: model.effectiveOutputMuted,
+            volume: renderKey.volume,
+            muted: renderKey.muted,
             active: outActive
         )
         button.image = image
-        button.imagePosition = model.showMenuBarPercent && outActive ? .imageLeading : .imageOnly
-        if model.showMenuBarPercent && outActive {
-            let text = model.effectiveOutputMuted ? L10n.mutedLabel : "\(model.effectiveOutputVolume)%"
+        button.imagePosition = renderKey.showPercent && outActive ? .imageLeading : .imageOnly
+        if renderKey.showPercent && outActive {
+            let text = renderKey.muted ? L10n.mutedLabel : "\(renderKey.volume)%"
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .medium)
             ]
@@ -1050,6 +1172,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         button.setAccessibilityLabel(fullLabel)
         button.toolTip = fullLabel
     }
+}
+
+private func runLatencyBenchmark() {
+    let iterations = 5
+    var snapshotTimes: [Double] = []
+    var ipcTimes: [Double] = []
+
+    // Warm up CoreAudio HAL proxy map once before measuring steady-state latency.
+    _ = AudioDeviceCatalog.captureSnapshot()
+
+    for _ in 0..<iterations {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        _ = AudioDeviceCatalog.captureSnapshot()
+        snapshotTimes.append((CFAbsoluteTimeGetCurrent() - t0) * 1000.0)
+
+        let t1 = CFAbsoluteTimeGetCurrent()
+        _ = VolumeIPC.read()
+        ipcTimes.append((CFAbsoluteTimeGetCurrent() - t1) * 1000.0)
+    }
+
+    let snapAvg = snapshotTimes.reduce(0, +) / Double(iterations)
+    let ipcAvg = ipcTimes.reduce(0, +) / Double(iterations)
+    print(String(format: "BENCH single-pass HAL snapshot avg=%.2f ms (budget <= 50.00 ms)", snapAvg))
+    print(String(format: "BENCH VolumeIPC.read()         avg=%.2f ms (budget <= 10.00 ms)", ipcAvg))
+    let pass = snapAvg <= 50.0 && ipcAvg <= 10.0
+    print(pass ? "PASS latency budget" : "FAIL latency budget exceeded")
+    exit(pass ? 0 : 1)
 }
 
 private func runSelfTestSuite() {

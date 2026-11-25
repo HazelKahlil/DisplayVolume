@@ -88,6 +88,14 @@ static AudioLayout parseLayout(const AudioBufferList *list, unsigned expectedCha
     return empty;
 }
 
+static inline void zeroOutputBuffers(AudioBufferList *output) {
+    if (!output) return;
+    for (unsigned i = 0; i < output->mNumberBuffers; i++) {
+        AudioBuffer *buffer = &output->mBuffers[i];
+        if (buffer->mData) memset(buffer->mData, 0, buffer->mDataByteSize);
+    }
+}
+
 static OSStatus render(
     AudioDeviceID device,
     const AudioTimeStamp *now,
@@ -101,31 +109,38 @@ static OSStatus render(
     GainState *state = context;
     atomic_fetch_add_explicit(&state->callbackCount, 1, memory_order_relaxed);
 
-    if (output) {
-        for (unsigned i = 0; i < output->mNumberBuffers; i++) {
-            AudioBuffer *buffer = &output->mBuffers[i];
-            if (buffer->mData) memset(buffer->mData, 0, buffer->mDataByteSize);
-        }
-    }
-
     AudioLayout source = parseLayout(input, state->expectedChannels);
     AudioLayout sink = parseLayout(output, state->expectedChannels);
 
     if (!sink.frames || (input && input->mNumberBuffers && !source.stride)) {
+        zeroOutputBuffers(output);
         atomic_store(&state->layoutError, true);
         return noErr;
     }
-    if (!source.frames) return noErr;
+    if (!source.frames) {
+        zeroOutputBuffers(output);
+        return noErr;
+    }
 
     unsigned frames = source.frames < sink.frames ? source.frames : sink.frames;
     unsigned channels = state->expectedChannels;
 
+    // Hoist per-channel base pointers once per callback (avoid inner-loop pointer arithmetic).
+    const float *inBases[DV_MAX_CHANNELS];
+    float *outBases[DV_MAX_CHANNELS];
+    for (unsigned c = 0; c < channels; c++) {
+        inBases[c] = (const float *)source.buffers[c]->mData + (source.stride > 1 ? c : 0);
+        outBases[c] = (float *)sink.buffers[c]->mData + (sink.stride > 1 ? c : 0);
+    }
+
     if (!atomic_load_explicit(&state->outputEnabled, memory_order_relaxed)) {
+        zeroOutputBuffers(output);
         if (atomic_load_explicit(&state->sawSignal, memory_order_relaxed)) return noErr;
-        for (unsigned i = 0; i < frames; i++) {
-            for (unsigned c = 0; c < channels; c++) {
-                const float *inPtr = (const float *)source.buffers[c]->mData + (source.stride > 1 ? c : 0);
-                if (fabsf(inPtr[i * source.stride]) > 0.0001f) {
+        unsigned inStride = source.stride;
+        for (unsigned c = 0; c < channels; c++) {
+            const float *inPtr = inBases[c];
+            for (unsigned i = 0; i < frames; i++) {
+                if (fabsf(inPtr[i * inStride]) > 0.0001f) {
                     atomic_store(&state->sawSignal, true);
                     return noErr;
                 }
@@ -141,16 +156,60 @@ static OSStatus render(
         state->step = (target - state->gain) / (float)state->remaining;
     }
 
-    for (unsigned i = 0; i < frames; i++) {
-        if (state->remaining) {
-            state->gain += state->step;
-            if (--state->remaining == 0) state->gain = state->destination;
-        }
+    unsigned inStride = source.stride;
+    unsigned outStride = sink.stride;
+
+    if (state->remaining == 0) {
+        // Steady-state fast path: zero unnecessary memset + SIMD auto-vectorizable loops.
         float g = state->gain;
+        if (g == 0.0f) {
+            zeroOutputBuffers(output);
+            return noErr;
+        }
+        if (inStride == 1 && outStride == 1) {
+            for (unsigned c = 0; c < channels; c++) {
+                const float *inPtr = inBases[c];
+                float *outPtr = outBases[c];
+                for (unsigned i = 0; i < frames; i++) {
+                    outPtr[i] = inPtr[i] * g;
+                }
+            }
+        } else if (inStride == channels && outStride == channels) {
+            const float *inInterleaved = (const float *)source.buffers[0]->mData;
+            float *outInterleaved = (float *)sink.buffers[0]->mData;
+            unsigned totalSamples = frames * channels;
+            for (unsigned s = 0; s < totalSamples; s++) {
+                outInterleaved[s] = inInterleaved[s] * g;
+            }
+        } else {
+            for (unsigned c = 0; c < channels; c++) {
+                const float *inPtr = inBases[c];
+                float *outPtr = outBases[c];
+                for (unsigned i = 0; i < frames; i++) {
+                    outPtr[i * outStride] = inPtr[i * inStride] * g;
+                }
+            }
+        }
+    } else {
+        for (unsigned i = 0; i < frames; i++) {
+            if (state->remaining) {
+                state->gain += state->step;
+                if (--state->remaining == 0) state->gain = state->destination;
+            }
+            float g = state->gain;
+            for (unsigned c = 0; c < channels; c++) {
+                outBases[c][i * outStride] = inBases[c][i * inStride] * g;
+            }
+        }
+    }
+
+    // Only zero unmatched tail frames if sink is larger than source.
+    if (sink.frames > frames) {
         for (unsigned c = 0; c < channels; c++) {
-            const float *inPtr = (const float *)source.buffers[c]->mData + (source.stride > 1 ? c : 0);
-            float *outPtr = (float *)sink.buffers[c]->mData + (sink.stride > 1 ? c : 0);
-            outPtr[i * sink.stride] = inPtr[i * source.stride] * g;
+            float *outPtr = outBases[c];
+            for (unsigned i = frames; i < sink.frames; i++) {
+                outPtr[i * outStride] = 0.0f;
+            }
         }
     }
     return noErr;
@@ -191,7 +250,7 @@ bool GainSelfTest(void) {
     bool rejected = GainHasLayoutError(state);
     GainDestroy(state);
 
-    // 2. Multichannel (4ch) interleaved -> interleaved & ramp smoothness
+    // 2. Multichannel (4ch) interleaved -> interleaved & ramp smoothness + steady-state SIMD fast path
     GainState *quad = GainCreate(400, 4); // rampLength = 4 frames
     if (!quad) return false;
     float qIn[16];
@@ -202,13 +261,46 @@ bool GainSelfTest(void) {
     GainEnableOutput(quad);
     GainSetVolume(quad, 1.0f);
     render(0, NULL, &qSrc, NULL, &qDst, NULL, quad);
-    bool quadOK = !GainHasLayoutError(quad)
+    bool quadRampOK = !GainHasLayoutError(quad)
         && fabsf(qOut[0] - 0.25f) < 0.001f
         && fabsf(qOut[4] - 0.50f) < 0.001f
         && fabsf(qOut[8] - 0.75f) < 0.001f
         && fabsf(qOut[12] - 1.0f) < 0.001f
         && fabsf(qOut[15] - 1.0f) < 0.001f;
+
+    // Second render hits steady-state (remaining == 0) interleaved fast path without prior memset.
+    for (int i = 0; i < 16; i++) { qIn[i] = 0.6f; qOut[i] = -99.0f; }
+    render(0, NULL, &qSrc, NULL, &qDst, NULL, quad);
+    bool quadSteadyOK = fabsf(qOut[0] - 0.6f) < 0.001f && fabsf(qOut[15] - 0.6f) < 0.001f;
+
+    // Zero-gain steady-state silence path.
+    GainSetVolume(quad, 0.0f);
+    render(0, NULL, &qSrc, NULL, &qDst, NULL, quad); // ramp down to 0
+    for (int i = 0; i < 16; i++) qOut[i] = 42.0f;
+    render(0, NULL, &qSrc, NULL, &qDst, NULL, quad); // steady-state g == 0
+    bool quadMuteOK = qOut[0] == 0.0f && qOut[15] == 0.0f;
     GainDestroy(quad);
 
-    return probe && scaled && muted && rejected && quadOK;
+    // 3. Steady-state planar path with tail-zeroing when sink.frames > source.frames
+    GainState *planar = GainCreate(100, 2); // rampLength = 1 frame
+    if (!planar) return false;
+    float pInL[2] = {0.8f, -0.4f}, pInR[2] = {-0.2f, 0.5f};
+    float pOutL[3] = {9, 9, 9}, pOutR[3] = {9, 9, 9};
+    struct { UInt32 count; AudioBuffer buffers[2]; } pSrcS = {
+        2, {{1, sizeof(pInL), pInL}, {1, sizeof(pInR), pInR}}
+    };
+    struct { UInt32 count; AudioBuffer buffers[2]; } pDstS = {
+        2, {{1, sizeof(pOutL), pOutL}, {1, sizeof(pOutR), pOutR}}
+    };
+    GainEnableOutput(planar);
+    GainSetVolume(planar, 0.5f); // gain = 0.25
+    render(0, NULL, (AudioBufferList *)&pSrcS, NULL, (AudioBufferList *)&pDstS, NULL, planar);
+    pOutL[2] = 7.0f; pOutR[2] = 7.0f;
+    render(0, NULL, (AudioBufferList *)&pSrcS, NULL, (AudioBufferList *)&pDstS, NULL, planar);
+    bool planarSteadyTailOK = fabsf(pOutL[0] - 0.2f) < 0.0001f
+        && fabsf(pOutR[1] - 0.125f) < 0.0001f
+        && pOutL[2] == 0.0f && pOutR[2] == 0.0f;
+    GainDestroy(planar);
+
+    return probe && scaled && muted && rejected && quadRampOK && quadSteadyOK && quadMuteOK && planarSteadyTailOK;
 }

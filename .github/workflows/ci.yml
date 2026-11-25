@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-macos:
+    name: Build, Static Guards, Tests & Latency Budget
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run full verification suite
+        env:
+          DISPLAYVOLUME_ADHOC_SIGN: "1"
+        run: |
+          chmod +x Scripts/build.sh Scripts/verify.sh Scripts/package_dmg.sh
+          ./Scripts/verify.sh
+
+      - name: Smoke-test DMG packaging on PR/main
+        run: ./Scripts/package_dmg.sh
