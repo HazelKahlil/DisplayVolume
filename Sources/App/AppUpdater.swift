@@ -173,25 +173,11 @@ final class AppUpdater: ObservableObject {
                     return
                 }
 
-                // Re-check playback, manifest expiry, and on-disk target build RIGHT before swap (prevents TOCTOU).
-                if isAudioActivelyPlayingOnLockedDisplay() {
-                    try? FileManager.default.removeItem(at: stagedAppURL.deletingLastPathComponent().deletingLastPathComponent())
-                    throw OTAValidationError.signatureVerificationFailed(L10n.text(
-                        "下载期间检测到外接显示器恢复播放，已中止自动换包以防爆音；请暂停播放后重试。",
-                        "Playback resumed on external display during download. Pause playback and retry update."
-                    ))
-                }
-                let iso = ISO8601DateFormatter()
-                guard let expires = iso.date(from: manifest.expiresAt), expires > Date() else {
-                    try? FileManager.default.removeItem(at: stagedAppURL.deletingLastPathComponent().deletingLastPathComponent())
-                    throw OTAValidationError.expiredManifest(manifest.expiresAt)
-                }
-
                 self?.setPhase(.installing)
                 try Self.atomicReplaceAndRelaunch(
                     stagedAppURL: stagedAppURL,
                     targetURL: targetURL,
-                    expectedNewBuild: manifest.build
+                    manifest: manifest
                 )
             } catch {
                 guard !Task.isCancelled else { return }
@@ -321,7 +307,7 @@ final class AppUpdater: ObservableObject {
     private nonisolated static func atomicReplaceAndRelaunch(
         stagedAppURL: URL,
         targetURL: URL,
-        expectedNewBuild: Int
+        manifest: OTAManifestPayload
     ) throws {
         try InstallTransactionLock.withExclusiveLock {
             let parentDir = targetURL.deletingLastPathComponent()
@@ -335,17 +321,32 @@ final class AppUpdater: ObservableObject {
                 try? fm.removeItem(at: sameVolumeStage)
             }
 
-            // Re-check on-disk target build under exclusive install lock so an externally upgraded bundle is never downgraded.
+            // Stage onto target's exact volume first so final safety checks run immediately before atomic swap.
+            try fm.copyItem(at: stagedAppURL, to: sameVolumeStage)
+
+            // Final lock-held checks immediately preceding replaceItemAt (closes TOCTOU window):
+            // 1. On-disk target build monotonic guard
             let onDiskPlist = targetURL.appendingPathComponent("Contents/Info.plist")
             if let plistData = try? Data(contentsOf: onDiskPlist),
                let dict = try? PropertyListSerialization.propertyList(from: plistData, format: nil) as? [String: Any],
                let onDiskBuild = Int(dict["CFBundleVersion"] as? String ?? "0"),
-               onDiskBuild >= expectedNewBuild {
-                throw OTAValidationError.notNewer(currentBuild: onDiskBuild, candidateBuild: expectedNewBuild)
+               onDiskBuild >= manifest.build {
+                throw OTAValidationError.notNewer(currentBuild: onDiskBuild, candidateBuild: manifest.build)
+            }
+            // 2. Manifest expiration guard
+            let iso = ISO8601DateFormatter()
+            guard let expires = iso.date(from: manifest.expiresAt), expires > Date() else {
+                throw OTAValidationError.expiredManifest(manifest.expiresAt)
+            }
+            // 3. Live CoreAudio playback guard on volume-locked external display
+            if let curOut = OutputDeviceCatalog.currentDefault(), curOut.isAutoControllable, curOut.isRunningSomewhere {
+                throw OTAValidationError.signatureVerificationFailed(L10n.text(
+                    "检测到外接显示器正在播放声音，已中止自动换包以防爆音；请暂停播放后重试。",
+                    "Playback active on external display right before swap. Pause playback and retry update."
+                ))
             }
 
-            // Stage onto target's exact volume and KEEP backup via `.withoutDeletingBackupItem` for relaunch rollback.
-            try fm.copyItem(at: stagedAppURL, to: sameVolumeStage)
+            // KEEP backup via `.withoutDeletingBackupItem` so relaunch script can roll back on failure.
             let replaced = try fm.replaceItemAt(
                 targetURL,
                 withItemAt: sameVolumeStage,

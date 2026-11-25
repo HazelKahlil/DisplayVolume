@@ -248,9 +248,9 @@ enum AudioHardwareControl {
             scope: scope,
             channelCount: clampedCh
         )
-        // Full-channel coverage requires either writable master element (0) or every active channel (1...N).
-        let fullVolumeCoverage = volumeElems == [kAudioObjectPropertyElementMain] || volumeElems.count == clampedCh
-        let fullMuteCoverage = muteElems == [kAudioObjectPropertyElementMain] || muteElems.count == clampedCh
+        // Full-channel coverage requires either writable master element (0) or EVERY actual channel (unclamped channelCount).
+        let fullVolumeCoverage = volumeElems == [kAudioObjectPropertyElementMain] || volumeElems.count == channelCount
+        let fullMuteCoverage = muteElems == [kAudioObjectPropertyElementMain] || muteElems.count == channelCount
         return ChannelControlMap(
             volumeElements: volumeElems,
             muteElements: muteElems,

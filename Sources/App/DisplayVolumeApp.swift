@@ -980,7 +980,10 @@ final class VolumeController: NSObject, ObservableObject {
 
         if DispatchThrottleMath.shouldEmit(now: now, lastSentAt: lastInputHALSentAt, minInterval: 0.020, isDragging: isDragging) {
             lastInputHALSentAt = now
-            if let proxy = xpcProxy(), (xpcConnected || EngineProvisioner.isEngineProcessRunning()) {
+            let engineExplicitlyStopped = UserDefaults.standard.bool(forKey: "UserStoppedEngine")
+            if !engineExplicitlyStopped, let proxy = xpcProxy() {
+                // Single-writer invariant: always route mic writes through Engine XPC whenever Engine is enabled
+                // (launchd MachServices wakes Engine on demand, preventing any UI/Engine dual-write overlap).
                 proxy.setMicVolume(clamped, deviceUID: mic.uid, isDragging: isDragging) { [weak self] ok, data in
                     Task { @MainActor in
                         guard let self else { return }
@@ -989,8 +992,7 @@ final class VolumeController: NSObject, ObservableObject {
                         }
                     }
                 }
-            } else {
-                // Only write HAL directly when Engine is confirmed NOT running (prevents dual-writer race).
+            } else if engineExplicitlyStopped && !EngineProvisioner.isEngineProcessRunning() {
                 _ = MicrophoneControl.applyVolume(clamped, for: mic, persistPreMute: !isDragging, clearMuteIfPositive: false)
             }
         }
@@ -1003,7 +1005,8 @@ final class VolumeController: NSObject, ObservableObject {
         guard let mic = currentInputDevice, mic.inputMuteSupported else { return }
         let now = ProcessInfo.processInfo.systemUptime
         inputLockUntil = now + 0.25
-        if let proxy = xpcProxy(), (xpcConnected || EngineProvisioner.isEngineProcessRunning()) {
+        let engineExplicitlyStopped = UserDefaults.standard.bool(forKey: "UserStoppedEngine")
+        if !engineExplicitlyStopped, let proxy = xpcProxy() {
             proxy.toggleMicMute(deviceUID: mic.uid, showOSD: showOSD) { [weak self] ok, data in
                 Task { @MainActor in
                     guard let self else { return }
@@ -1015,7 +1018,8 @@ final class VolumeController: NSObject, ObservableObject {
                     }
                 }
             }
-        } else if let updated = MicrophoneControl.toggleMute(for: mic) {
+        } else if engineExplicitlyStopped && !EngineProvisioner.isEngineProcessRunning(),
+                  let updated = MicrophoneControl.toggleMute(for: mic) {
             if applyInputStatus(updated) { onChange?() }
         }
     }

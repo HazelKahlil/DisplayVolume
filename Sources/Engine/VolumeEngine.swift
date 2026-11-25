@@ -19,7 +19,7 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate, NSXPCListener
     private var phase = VolumeState.Phase.idle
     private var route: AudioRoute?
     private var routeGeneration: UInt64 = 0
-    private var routeStartInFlight = false
+    private var inFlightRouteGeneration: UInt64?
     private var unsupportedFormatDeviceUID: String?
     private var consecutiveRouteFailures = 0
     private var profiles: [String: DeviceVolumeProfile] = [:]
@@ -721,7 +721,7 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate, NSXPCListener
 
         if enabled,
            route == nil,
-           !routeStartInFlight,
+           inFlightRouteGeneration == nil,
            now >= retryAfter,
            let current,
            current.isAutoControllable,
@@ -736,7 +736,7 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate, NSXPCListener
     private func startRouteAsync(for target: AudioDeviceInfo) {
         routeGeneration &+= 1
         let gen = routeGeneration
-        routeStartInFlight = true
+        inFlightRouteGeneration = gen
         let initialFraction = Double(muted ? 0 : min(volume, limit)) / 100.0
         let useImmediate = verifiedCapture
         let candidate = AudioRoute(device: target)
@@ -756,18 +756,21 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate, NSXPCListener
                     candidate.stop()
                     return
                 }
+                if self.inFlightRouteGeneration == gen {
+                    self.inFlightRouteGeneration = nil
+                }
                 guard gen == self.routeGeneration,
                       !self.isAsleepForCurrentDevice,
                       self.enabled,
                       self.device?.uid == target.uid else {
-                    // Route superseded while starting — tear down off MainActor and immediately re-evaluate current output!
-                    self.routeStartInFlight = false
+                    // Route superseded while starting — tear down off MainActor and re-evaluate only if no newer start is active.
                     self.routeQueue.async { candidate.stop() }
-                    self.evaluateRoute()
+                    if self.inFlightRouteGeneration == nil {
+                        self.evaluateRoute()
+                    }
                     return
                 }
 
-                self.routeStartInFlight = false
                 switch result {
                 case .success(let activeRoute):
                     activeRoute.onStreamFormatChanged = { [weak self] in
@@ -872,7 +875,7 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate, NSXPCListener
 
     private func dropRoute(reason: String? = nil, sync: Bool) {
         routeGeneration &+= 1
-        routeStartInFlight = false
+        inFlightRouteGeneration = nil
         stopTimers()
         let oldRoute = route
         route = nil
