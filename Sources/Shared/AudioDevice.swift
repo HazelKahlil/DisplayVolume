@@ -22,7 +22,7 @@ func audioAddress(
     AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: element)
 }
 
-enum AudioTransportKind: String, Codable, Equatable {
+enum AudioTransportKind: String, Codable, Equatable, Sendable {
     case displayPort
     case hdmi
     case thunderbolt
@@ -81,7 +81,41 @@ enum AudioTransportKind: String, Codable, Equatable {
     }
 }
 
-struct AudioDeviceInfo: Equatable, Hashable, Identifiable {
+/// Unified channel control map for a device scope so read, write, and HAL listeners
+/// always operate on the exact same set of active channel elements.
+struct ChannelControlMap: Equatable, Hashable, Sendable {
+    let volumeElements: [UInt32]
+    let muteElements: [UInt32]
+    let coversAllChannelsForVolume: Bool
+    let coversAllChannelsForMute: Bool
+
+    var hasWritableVolume: Bool { !volumeElements.isEmpty }
+    var hasFullChannelVolume: Bool { !volumeElements.isEmpty && coversAllChannelsForVolume }
+    var hasFullHardwareMute: Bool { !muteElements.isEmpty && coversAllChannelsForMute }
+    var observedElements: [UInt32] {
+        Array(Set(volumeElements + muteElements)).sorted()
+    }
+
+    static let empty = ChannelControlMap(
+        volumeElements: [],
+        muteElements: [],
+        coversAllChannelsForVolume: false,
+        coversAllChannelsForMute: false
+    )
+
+    /// Pure evaluator for multi-channel mute states: returns true ONLY when every mapped mute element is muted.
+    static func aggregateMuteRead(_ values: [Bool?], expectedCount: Int) -> Bool? {
+        guard expectedCount > 0, values.count == expectedCount else { return nil }
+        var allMuted = true
+        for v in values {
+            guard let v else { return nil }
+            if !v { allMuted = false }
+        }
+        return allMuted
+    }
+}
+
+struct AudioDeviceInfo: Equatable, Hashable, Identifiable, Sendable {
     let id: AudioDeviceID
     let name: String
     let uid: String
@@ -92,6 +126,8 @@ struct AudioDeviceInfo: Equatable, Hashable, Identifiable {
     let muteControlAvailable: Bool
     let inputVolumeControlAvailable: Bool
     let inputMuteControlAvailable: Bool
+    let outputControlMap: ChannelControlMap
+    let inputControlMap: ChannelControlMap
     let isHidden: Bool
 
     init(
@@ -105,6 +141,8 @@ struct AudioDeviceInfo: Equatable, Hashable, Identifiable {
         muteControlAvailable: Bool = false,
         inputVolumeControlAvailable: Bool = false,
         inputMuteControlAvailable: Bool = false,
+        outputControlMap: ChannelControlMap = .empty,
+        inputControlMap: ChannelControlMap = .empty,
         isHidden: Bool
     ) {
         self.id = id
@@ -117,6 +155,8 @@ struct AudioDeviceInfo: Equatable, Hashable, Identifiable {
         self.muteControlAvailable = muteControlAvailable
         self.inputVolumeControlAvailable = inputVolumeControlAvailable
         self.inputMuteControlAvailable = inputMuteControlAvailable
+        self.outputControlMap = outputControlMap
+        self.inputControlMap = inputControlMap
         self.isHidden = isHidden
     }
 
@@ -137,9 +177,12 @@ struct AudioDeviceInfo: Equatable, Hashable, Identifiable {
         !isHidden && !transportKind.isVirtualOrAggregate && inputChannels > 0
     }
 
-    /// True if the input device supports either hardware mute or scalar gain attenuation to 0.
+    /// True if the input device supports verified full-channel hardware mute OR full-channel scalar attenuation.
     var inputMuteSupported: Bool {
-        inputMuteControlAvailable || inputVolumeControlAvailable
+        if inputMuteControlAvailable { return true }
+        if inputControlMap.hasFullChannelVolume { return true }
+        // Support constructed unit-test fixtures that didn't populate inputControlMap explicitly.
+        return inputVolumeControlAvailable && inputControlMap == .empty
     }
 
     var symbolName: String {
@@ -183,136 +226,193 @@ struct AudioDeviceInfo: Equatable, Hashable, Identifiable {
 }
 
 /// Direct CoreAudio HAL property access for hardware output/input volume and mute.
-/// Uses HAL property calls only — never opens an audio capture stream (no mic privacy dot, no AirPods HFP downgrade).
+/// DisplayVolume itself never opens an audio capture stream for microphone control (no mic privacy dot from DisplayVolume).
 enum AudioHardwareControl {
-    private static func candidateElements(channelCount: Int) -> [UInt32] {
-        let maxCh = UInt32(min(8, max(1, channelCount)))
-        return [0] + Array(1...maxCh)
+    static func probeControlMap(
+        deviceID: AudioDeviceID,
+        scope: AudioObjectPropertyScope,
+        channelCount: Int
+    ) -> ChannelControlMap {
+        guard channelCount > 0 else { return .empty }
+        let clampedCh = min(8, max(1, channelCount))
+
+        let volumeElems = writableElements(
+            deviceID: deviceID,
+            selector: kAudioDevicePropertyVolumeScalar,
+            scope: scope,
+            channelCount: clampedCh
+        )
+        let muteElems = writableElements(
+            deviceID: deviceID,
+            selector: kAudioDevicePropertyMute,
+            scope: scope,
+            channelCount: clampedCh
+        )
+        // Full-channel coverage requires either writable master element (0) or EVERY actual channel (unclamped channelCount).
+        let fullVolumeCoverage = volumeElems == [kAudioObjectPropertyElementMain] || volumeElems.count == channelCount
+        let fullMuteCoverage = muteElems == [kAudioObjectPropertyElementMain] || muteElems.count == channelCount
+        return ChannelControlMap(
+            volumeElements: volumeElems,
+            muteElements: muteElems,
+            coversAllChannelsForVolume: fullVolumeCoverage,
+            coversAllChannelsForMute: fullMuteCoverage
+        )
     }
 
-    static func hasWritableProperty(
-        _ id: AudioDeviceID,
+    private static func writableElements(
+        deviceID: AudioDeviceID,
         selector: AudioObjectPropertySelector,
         scope: AudioObjectPropertyScope,
         channelCount: Int
-    ) -> Bool {
-        for element in candidateElements(channelCount: channelCount) {
-            var property = audioAddress(selector, scope: scope, element: element)
-            guard AudioObjectHasProperty(id, &property) else { continue }
+    ) -> [UInt32] {
+        var mainProp = audioAddress(selector, scope: scope, element: kAudioObjectPropertyElementMain)
+        if AudioObjectHasProperty(deviceID, &mainProp) {
             var writable: DarwinBoolean = false
-            if AudioObjectIsPropertySettable(id, &property, &writable) == noErr && writable.boolValue {
-                return true
+            if AudioObjectIsPropertySettable(deviceID, &mainProp, &writable) == noErr && writable.boolValue {
+                return [kAudioObjectPropertyElementMain]
             }
         }
-        return false
+        var perChannel: [UInt32] = []
+        for ch in 1...UInt32(channelCount) {
+            var prop = audioAddress(selector, scope: scope, element: ch)
+            guard AudioObjectHasProperty(deviceID, &prop) else { continue }
+            var writable: DarwinBoolean = false
+            if AudioObjectIsPropertySettable(deviceID, &prop, &writable) == noErr && writable.boolValue {
+                perChannel.append(ch)
+            }
+        }
+        return perChannel
+    }
+
+    static func readScalarVolume(
+        deviceID: AudioDeviceID,
+        scope: AudioObjectPropertyScope,
+        elements: [UInt32]
+    ) -> Float? {
+        guard !elements.isEmpty else { return nil }
+        var values: [Float] = []
+        values.reserveCapacity(elements.count)
+        for elem in elements {
+            var prop = audioAddress(kAudioDevicePropertyVolumeScalar, scope: scope, element: elem)
+            var value: Float32 = 0
+            var size = UInt32(MemoryLayout<Float32>.size)
+            guard AudioObjectGetPropertyData(deviceID, &prop, 0, nil, &size, &value) == noErr else {
+                return nil
+            }
+            values.append(min(1, max(0, value)))
+        }
+        return values.reduce(0, +) / Float(values.count)
     }
 
     static func readScalarVolume(deviceID: AudioDeviceID, scope: AudioObjectPropertyScope, channelCount: Int) -> Float? {
-        var mainProp = audioAddress(kAudioDevicePropertyVolumeScalar, scope: scope, element: kAudioObjectPropertyElementMain)
-        if AudioObjectHasProperty(deviceID, &mainProp) {
-            var value: Float32 = 0
-            var size = UInt32(MemoryLayout<Float32>.size)
-            if AudioObjectGetPropertyData(deviceID, &mainProp, 0, nil, &size, &value) == noErr {
-                return min(1, max(0, value))
-            }
-        }
+        let map = probeControlMap(deviceID: deviceID, scope: scope, channelCount: channelCount)
+        return readScalarVolume(deviceID: deviceID, scope: scope, elements: map.volumeElements)
+    }
 
-        let maxCh = UInt32(min(8, max(1, channelCount)))
-        var values: [Float] = []
-        for ch in 1...maxCh {
-            var prop = audioAddress(kAudioDevicePropertyVolumeScalar, scope: scope, element: ch)
-            guard AudioObjectHasProperty(deviceID, &prop) else { continue }
-            var value: Float32 = 0
-            var size = UInt32(MemoryLayout<Float32>.size)
-            if AudioObjectGetPropertyData(deviceID, &prop, 0, nil, &size, &value) == noErr {
-                values.append(min(1, max(0, value)))
+    @discardableResult
+    static func writeScalarVolume(
+        deviceID: AudioDeviceID,
+        scope: AudioObjectPropertyScope,
+        elements: [UInt32],
+        fraction: Float
+    ) -> Bool {
+        guard !elements.isEmpty else { return false }
+        var value = Float32(min(1, max(0, fraction)))
+        let size = UInt32(MemoryLayout<Float32>.size)
+        var allOK = true
+        for elem in elements {
+            var prop = audioAddress(kAudioDevicePropertyVolumeScalar, scope: scope, element: elem)
+            if AudioObjectSetPropertyData(deviceID, &prop, 0, nil, size, &value) != noErr {
+                allOK = false
             }
         }
-        guard !values.isEmpty else { return nil }
-        return values.reduce(0, +) / Float(values.count)
+        return allOK
     }
 
     @discardableResult
     static func writeScalarVolume(deviceID: AudioDeviceID, scope: AudioObjectPropertyScope, channelCount: Int, fraction: Float) -> Bool {
-        var value = Float32(min(1, max(0, fraction)))
-        let size = UInt32(MemoryLayout<Float32>.size)
+        let map = probeControlMap(deviceID: deviceID, scope: scope, channelCount: channelCount)
+        return writeScalarVolume(deviceID: deviceID, scope: scope, elements: map.volumeElements, fraction: fraction)
+    }
 
-        var mainProp = audioAddress(kAudioDevicePropertyVolumeScalar, scope: scope, element: kAudioObjectPropertyElementMain)
-        if AudioObjectHasProperty(deviceID, &mainProp) {
-            var writable: DarwinBoolean = false
-            if AudioObjectIsPropertySettable(deviceID, &mainProp, &writable) == noErr && writable.boolValue {
-                return AudioObjectSetPropertyData(deviceID, &mainProp, 0, nil, size, &value) == noErr
+    /// Reads mute state across all mapped elements. Returns true ONLY if EVERY mapped channel is muted.
+    /// Returns nil if any channel read fails so callers never fabricate an "unmuted" or "muted" claim.
+    static func readMute(
+        deviceID: AudioDeviceID,
+        scope: AudioObjectPropertyScope,
+        elements: [UInt32]
+    ) -> Bool? {
+        guard !elements.isEmpty else { return nil }
+        var reads: [Bool?] = []
+        reads.reserveCapacity(elements.count)
+        for elem in elements {
+            var prop = audioAddress(kAudioDevicePropertyMute, scope: scope, element: elem)
+            var raw: UInt32 = 0
+            var size = UInt32(MemoryLayout<UInt32>.size)
+            if AudioObjectGetPropertyData(deviceID, &prop, 0, nil, &size, &raw) == noErr {
+                reads.append(raw != 0)
+            } else {
+                reads.append(nil)
             }
         }
-
-        let maxCh = UInt32(min(8, max(1, channelCount)))
-        var wroteAny = false
-        for ch in 1...maxCh {
-            var prop = audioAddress(kAudioDevicePropertyVolumeScalar, scope: scope, element: ch)
-            guard AudioObjectHasProperty(deviceID, &prop) else { continue }
-            var writable: DarwinBoolean = false
-            if AudioObjectIsPropertySettable(deviceID, &prop, &writable) == noErr && writable.boolValue {
-                if AudioObjectSetPropertyData(deviceID, &prop, 0, nil, size, &value) == noErr {
-                    wroteAny = true
-                }
-            }
-        }
-        return wroteAny
+        return ChannelControlMap.aggregateMuteRead(reads, expectedCount: elements.count)
     }
 
     static func readMute(deviceID: AudioDeviceID, scope: AudioObjectPropertyScope, channelCount: Int) -> Bool? {
-        for element in candidateElements(channelCount: channelCount) {
-            var prop = audioAddress(kAudioDevicePropertyMute, scope: scope, element: element)
-            guard AudioObjectHasProperty(deviceID, &prop) else { continue }
-            var muted: UInt32 = 0
-            var size = UInt32(MemoryLayout<UInt32>.size)
-            if AudioObjectGetPropertyData(deviceID, &prop, 0, nil, &size, &muted) == noErr {
-                return muted != 0
+        let map = probeControlMap(deviceID: deviceID, scope: scope, channelCount: channelCount)
+        guard map.hasFullHardwareMute else { return nil }
+        return readMute(deviceID: deviceID, scope: scope, elements: map.muteElements)
+    }
+
+    /// Writes mute across EVERY mapped channel and returns true ONLY when all channels succeed.
+    @discardableResult
+    static func writeMute(
+        deviceID: AudioDeviceID,
+        scope: AudioObjectPropertyScope,
+        elements: [UInt32],
+        muted: Bool
+    ) -> Bool {
+        guard !elements.isEmpty else { return false }
+        var raw: UInt32 = muted ? 1 : 0
+        let size = UInt32(MemoryLayout<UInt32>.size)
+        var allOK = true
+        for elem in elements {
+            var prop = audioAddress(kAudioDevicePropertyMute, scope: scope, element: elem)
+            if AudioObjectSetPropertyData(deviceID, &prop, 0, nil, size, &raw) != noErr {
+                allOK = false
             }
         }
-        return nil
+        return allOK
     }
 
     @discardableResult
     static func writeMute(deviceID: AudioDeviceID, scope: AudioObjectPropertyScope, channelCount: Int, muted: Bool) -> Bool {
-        var raw: UInt32 = muted ? 1 : 0
-        let size = UInt32(MemoryLayout<UInt32>.size)
-
-        var mainProp = audioAddress(kAudioDevicePropertyMute, scope: scope, element: kAudioObjectPropertyElementMain)
-        if AudioObjectHasProperty(deviceID, &mainProp) {
-            var writable: DarwinBoolean = false
-            if AudioObjectIsPropertySettable(deviceID, &mainProp, &writable) == noErr && writable.boolValue {
-                return AudioObjectSetPropertyData(deviceID, &mainProp, 0, nil, size, &raw) == noErr
-            }
-        }
-
-        let maxCh = UInt32(min(8, max(1, channelCount)))
-        var wroteAny = false
-        for ch in 1...maxCh {
-            var prop = audioAddress(kAudioDevicePropertyMute, scope: scope, element: ch)
-            guard AudioObjectHasProperty(deviceID, &prop) else { continue }
-            var writable: DarwinBoolean = false
-            if AudioObjectIsPropertySettable(deviceID, &prop, &writable) == noErr && writable.boolValue {
-                if AudioObjectSetPropertyData(deviceID, &prop, 0, nil, size, &raw) == noErr {
-                    wroteAny = true
-                }
-            }
-        }
-        return wroteAny
+        let map = probeControlMap(deviceID: deviceID, scope: scope, channelCount: channelCount)
+        guard map.hasFullHardwareMute else { return false }
+        return writeMute(deviceID: deviceID, scope: scope, elements: map.muteElements, muted: muted)
     }
 }
 
 /// Single-pass CoreAudio device snapshot to eliminate redundant multi-scan HAL stalls on popover open & topology bursts.
-struct AudioDeviceSnapshot: Equatable {
+struct AudioDeviceSnapshot: Equatable, Sendable {
     let outputDevices: [AudioDeviceInfo]
     let inputDevices: [AudioDeviceInfo]
     let defaultOutput: AudioDeviceInfo?
     let defaultInput: AudioDeviceInfo?
+    let querySucceeded: Bool
 }
 
 enum AudioDeviceCatalog {
     static func captureSnapshot() -> AudioDeviceSnapshot {
-        let all = OutputDeviceCatalog.allDevices()
+        guard let all = OutputDeviceCatalog.fetchAllDevicesWithStatus() else {
+            return AudioDeviceSnapshot(
+                outputDevices: [],
+                inputDevices: [],
+                defaultOutput: OutputDeviceCatalog.currentDefault(),
+                defaultInput: InputDeviceCatalog.currentDefault(),
+                querySucceeded: false
+            )
+        }
         let byID = Dictionary(uniqueKeysWithValues: all.map { ($0.id, $0) })
 
         let outputs = OutputDeviceCatalog.sortOutputs(all.filter { $0.outputChannels > 0 && !$0.isHidden })
@@ -330,7 +430,8 @@ enum AudioDeviceCatalog {
             outputDevices: outputs,
             inputDevices: inputs,
             defaultOutput: defaultOut,
-            defaultInput: defaultIn
+            defaultInput: defaultIn,
+            querySucceeded: true
         )
     }
 
@@ -368,37 +469,52 @@ enum OutputDeviceCatalog {
         sortOutputs(allDevices().filter { $0.outputChannels > 0 && !$0.isHidden })
     }
 
+    /// Switches playback output only (does NOT silently alter system alert sound routing).
     @discardableResult
-    static func setDefaultOutput(deviceID: AudioDeviceID) -> Bool {
+    static func setDefaultOutput(deviceID: AudioDeviceID, expectedUID: String? = nil) -> Bool {
         guard deviceID != kAudioObjectUnknown else { return false }
+        if let expectedUID, readString(deviceID, kAudioDevicePropertyDeviceUID) != expectedUID {
+            return setDefaultOutput(uid: expectedUID)
+        }
         var id = deviceID
         let size = UInt32(MemoryLayout.size(ofValue: id))
         var outAddr = audioAddress(kAudioHardwarePropertyDefaultOutputDevice)
-        let outStatus = AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &outAddr, 0, nil, size, &id)
-        var sysAddr = audioAddress(kAudioHardwarePropertyDefaultSystemOutputDevice)
-        _ = AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &sysAddr, 0, nil, size, &id)
-        return outStatus == noErr
+        return AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &outAddr, 0, nil, size, &id) == noErr
     }
 
     @discardableResult
     static func setDefaultOutput(uid: String) -> Bool {
         guard let target = allOutputDevices().first(where: { $0.uid == uid }) else { return false }
-        return setDefaultOutput(deviceID: target.id)
+        return setDefaultOutput(deviceID: target.id, expectedUID: nil)
     }
 
     static func allDevices() -> [AudioDeviceInfo] {
+        fetchAllDevicesWithStatus() ?? []
+    }
+
+    /// Bounded retry query that trims strictly to the byte count returned by HAL (handles hotplug race cleanly).
+    static func fetchAllDevicesWithStatus() -> [AudioDeviceInfo]? {
         var property = audioAddress(kAudioHardwarePropertyDevices)
-        var size: UInt32 = 0
-        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &property, 0, nil, &size) == noErr,
-              size > 0 else {
-            return []
+        let stride = MemoryLayout<AudioDeviceID>.stride
+        for _ in 0..<2 {
+            var size: UInt32 = 0
+            guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &property, 0, nil, &size) == noErr else {
+                return nil
+            }
+            if size == 0 { return [] }
+            let capacity = Int(size) / stride
+            guard capacity > 0 else { return [] }
+            var ids = [AudioDeviceID](repeating: kAudioObjectUnknown, count: capacity)
+            var actualSize = size
+            let status = ids.withUnsafeMutableBytes { buf in
+                AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &property, 0, nil, &actualSize, buf.baseAddress!)
+            }
+            if status == noErr {
+                let actualCount = min(capacity, Int(actualSize) / stride)
+                return ids.prefix(actualCount).compactMap { $0 != kAudioObjectUnknown ? inspect(deviceID: $0) : nil }
+            }
         }
-        var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.stride)
-        let status = ids.withUnsafeMutableBytes { buf in
-            AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &property, 0, nil, &size, buf.baseAddress!)
-        }
-        guard status == noErr else { return [] }
-        return ids.compactMap { inspect(deviceID: $0) }
+        return nil
     }
 
     static func inspect(deviceID: AudioDeviceID) -> AudioDeviceInfo? {
@@ -416,18 +532,12 @@ enum OutputDeviceCatalog {
         let inChannels = channelCount(deviceID, scope: kAudioDevicePropertyScopeInput)
         guard outChannels > 0 || inChannels > 0 else { return nil }
 
-        let outVol = outChannels > 0 && AudioHardwareControl.hasWritableProperty(
-            deviceID, selector: kAudioDevicePropertyVolumeScalar, scope: kAudioDevicePropertyScopeOutput, channelCount: outChannels
-        )
-        let outMute = outChannels > 0 && AudioHardwareControl.hasWritableProperty(
-            deviceID, selector: kAudioDevicePropertyMute, scope: kAudioDevicePropertyScopeOutput, channelCount: outChannels
-        )
-        let inVol = inChannels > 0 && AudioHardwareControl.hasWritableProperty(
-            deviceID, selector: kAudioDevicePropertyVolumeScalar, scope: kAudioDevicePropertyScopeInput, channelCount: inChannels
-        )
-        let inMute = inChannels > 0 && AudioHardwareControl.hasWritableProperty(
-            deviceID, selector: kAudioDevicePropertyMute, scope: kAudioDevicePropertyScopeInput, channelCount: inChannels
-        )
+        let outMap = outChannels > 0
+            ? AudioHardwareControl.probeControlMap(deviceID: deviceID, scope: kAudioDevicePropertyScopeOutput, channelCount: outChannels)
+            : .empty
+        let inMap = inChannels > 0
+            ? AudioHardwareControl.probeControlMap(deviceID: deviceID, scope: kAudioDevicePropertyScopeInput, channelCount: inChannels)
+            : .empty
 
         return AudioDeviceInfo(
             id: deviceID,
@@ -436,10 +546,12 @@ enum OutputDeviceCatalog {
             transport: transport,
             outputChannels: outChannels,
             inputChannels: inChannels,
-            volumeControlAvailable: outVol,
-            muteControlAvailable: outMute,
-            inputVolumeControlAvailable: inVol,
-            inputMuteControlAvailable: inMute,
+            volumeControlAvailable: outMap.hasWritableVolume,
+            muteControlAvailable: outMap.hasFullHardwareMute,
+            inputVolumeControlAvailable: inMap.hasWritableVolume,
+            inputMuteControlAvailable: inMap.hasFullHardwareMute,
+            outputControlMap: outMap,
+            inputControlMap: inMap,
             isHidden: isHiddenDevice(deviceID)
         )
     }
@@ -454,20 +566,30 @@ enum OutputDeviceCatalog {
     private static func channelCount(_ id: AudioDeviceID, scope: AudioObjectPropertyScope) -> Int {
         var property = audioAddress(kAudioDevicePropertyStreamConfiguration, scope: scope)
         var size: UInt32 = 0
-        guard AudioObjectGetPropertyDataSize(id, &property, 0, nil, &size) == noErr, size > 0 else {
+        guard AudioObjectGetPropertyDataSize(id, &property, 0, nil, &size) == noErr,
+              size >= UInt32(MemoryLayout<UInt32>.size) else {
             return 0
         }
-        let raw = UnsafeMutableRawPointer.allocate(byteCount: Int(size), alignment: MemoryLayout<AudioBufferList>.alignment)
+        let allocBytes = Int(size)
+        let raw = UnsafeMutableRawPointer.allocate(byteCount: allocBytes, alignment: MemoryLayout<AudioBufferList>.alignment)
         defer { raw.deallocate() }
-        guard AudioObjectGetPropertyData(id, &property, 0, nil, &size, raw) == noErr else {
+        var actualSize = size
+        guard AudioObjectGetPropertyData(id, &property, 0, nil, &actualSize, raw) == noErr,
+              actualSize >= UInt32(MemoryLayout<UInt32>.size) else {
             return 0
         }
         let list = raw.assumingMemoryBound(to: AudioBufferList.self)
+        let declaredBuffers = Int(list.pointee.mNumberBuffers)
+        let headerOffset = MemoryLayout<AudioBufferList>.offset(of: \.mBuffers) ?? MemoryLayout<UInt32>.size
+        let requiredBytes = headerOffset + declaredBuffers * MemoryLayout<AudioBuffer>.stride
+        guard declaredBuffers >= 0, requiredBytes <= Int(actualSize), requiredBytes <= allocBytes else {
+            return 0
+        }
         let buffers = UnsafeMutableAudioBufferListPointer(list)
         return buffers.reduce(0) { $0 + Int($1.mNumberChannels) }
     }
 
-    private static func readString(_ id: AudioObjectID, _ selector: AudioObjectPropertySelector) -> String? {
+    static func readString(_ id: AudioObjectID, _ selector: AudioObjectPropertySelector) -> String? {
         var property = audioAddress(selector)
         var value: Unmanaged<CFString>?
         var size = UInt32(MemoryLayout.size(ofValue: value))
@@ -503,8 +625,11 @@ enum InputDeviceCatalog {
     }
 
     @discardableResult
-    static func setDefaultInput(deviceID: AudioDeviceID) -> Bool {
+    static func setDefaultInput(deviceID: AudioDeviceID, expectedUID: String? = nil) -> Bool {
         guard deviceID != kAudioObjectUnknown else { return false }
+        if let expectedUID, OutputDeviceCatalog.readString(deviceID, kAudioDevicePropertyDeviceUID) != expectedUID {
+            return setDefaultInput(uid: expectedUID)
+        }
         var id = deviceID
         let size = UInt32(MemoryLayout.size(ofValue: id))
         var inAddr = audioAddress(kAudioHardwarePropertyDefaultInputDevice)
@@ -514,95 +639,152 @@ enum InputDeviceCatalog {
     @discardableResult
     static func setDefaultInput(uid: String) -> Bool {
         guard let target = allInputDevices().first(where: { $0.uid == uid }) else { return false }
-        return setDefaultInput(deviceID: target.id)
+        return setDefaultInput(deviceID: target.id, expectedUID: nil)
     }
 }
 
-/// Shared hardware + soft-gain microphone mute helper so both UI and background Engine stay consistent.
+/// Shared hardware + soft-gain microphone controller.
+/// Mutations are serialized inside DisplayVolumeEngine to prevent dual-process races on HAL mute/gain & UserDefaults.
 enum MicrophoneControl {
     private static let savedVolumeKey = "SavedMicVolumeBeforeSoftMute"
 
-    struct Status: Equatable {
+    struct Status: Equatable, Codable, Sendable {
         let volumePercent: Int
         let muted: Bool
         let volumeWritable: Bool
         let muteSupported: Bool
         let usesSoftMute: Bool
+        let readSucceeded: Bool
     }
 
     static func readStatus(for device: AudioDeviceInfo) -> Status {
-        let rawScalar = AudioHardwareControl.readScalarVolume(
-            deviceID: device.id,
-            scope: kAudioDevicePropertyScopeInput,
-            channelCount: device.inputChannels
-        )
-        let currentPct = Int(((rawScalar ?? 0.5) * 100.0).rounded())
-
-        if device.inputMuteControlAvailable {
-            let hwMuted = AudioHardwareControl.readMute(
+        let map = device.inputControlMap.hasWritableVolume || device.inputControlMap.hasFullHardwareMute
+            ? device.inputControlMap
+            : AudioHardwareControl.probeControlMap(
                 deviceID: device.id,
                 scope: kAudioDevicePropertyScopeInput,
                 channelCount: device.inputChannels
-            ) ?? false
+            )
+
+        let rawScalar = map.hasWritableVolume
+            ? AudioHardwareControl.readScalarVolume(deviceID: device.id, scope: kAudioDevicePropertyScopeInput, elements: map.volumeElements)
+            : nil
+        let currentPct = rawScalar.map { Int(($0 * 100.0).rounded()) } ?? 0
+
+        if map.hasFullHardwareMute {
+            guard let hwMuted = AudioHardwareControl.readMute(
+                deviceID: device.id,
+                scope: kAudioDevicePropertyScopeInput,
+                elements: map.muteElements
+            ) else {
+                return Status(
+                    volumePercent: currentPct,
+                    muted: false,
+                    volumeWritable: map.hasWritableVolume,
+                    muteSupported: true,
+                    usesSoftMute: false,
+                    readSucceeded: false
+                )
+            }
             return Status(
                 volumePercent: currentPct,
                 muted: hwMuted,
-                volumeWritable: device.inputVolumeControlAvailable,
+                volumeWritable: map.hasWritableVolume,
                 muteSupported: true,
-                usesSoftMute: false
+                usesSoftMute: false,
+                readSucceeded: rawScalar != nil || !map.hasWritableVolume
             )
         }
 
-        if device.inputVolumeControlAvailable {
-            let isSoftMuted = currentPct == 0
-            let displayPct = isSoftMuted ? (savedPreMuteVolume(uid: device.uid) ?? 50) : currentPct
+        if map.hasFullChannelVolume {
+            guard let rawScalar else {
+                return Status(
+                    volumePercent: 0,
+                    muted: false,
+                    volumeWritable: true,
+                    muteSupported: true,
+                    usesSoftMute: true,
+                    readSucceeded: false
+                )
+            }
+            // Exact scalar near-zero check across ALL active channels (never claims muted if any channel lacks gain control).
+            let isSoftZero = rawScalar <= 0.001
+            let displayPct = isSoftZero ? (savedPreMuteVolume(uid: device.uid) ?? 50) : currentPct
             return Status(
                 volumePercent: displayPct,
-                muted: isSoftMuted,
+                muted: isSoftZero,
                 volumeWritable: true,
                 muteSupported: true,
-                usesSoftMute: true
+                usesSoftMute: true,
+                readSucceeded: true
+            )
+        }
+
+        if map.hasWritableVolume {
+            // Partial-channel gain control: allow gain slider, but NEVER report muteSupported or muted.
+            return Status(
+                volumePercent: currentPct,
+                muted: false,
+                volumeWritable: true,
+                muteSupported: false,
+                usesSoftMute: false,
+                readSucceeded: rawScalar != nil
             )
         }
 
         return Status(
-            volumePercent: currentPct,
+            volumePercent: 0,
             muted: false,
             volumeWritable: false,
             muteSupported: false,
-            usesSoftMute: false
+            usesSoftMute: false,
+            readSucceeded: true
         )
     }
 
-    /// Writes microphone gain to CoreAudio HAL.
-    /// Pass `persistPreMute: false` during continuous slider drags so UserDefaults plist writes never stall the main thread.
-    static func applyVolume(_ percent: Int, for device: AudioDeviceInfo, persistPreMute: Bool = true) {
+    /// Writes microphone gain to CoreAudio HAL without clearing an explicit hardware mute unless `clearMuteIfPositive` is true.
+    @discardableResult
+    static func applyVolume(
+        _ percent: Int,
+        for device: AudioDeviceInfo,
+        persistPreMute: Bool = true,
+        clearMuteIfPositive: Bool = false
+    ) -> Bool {
         let clamped = min(100, max(0, percent))
-        guard device.inputVolumeControlAvailable else { return }
-        _ = AudioHardwareControl.writeScalarVolume(
+        let map = device.inputControlMap.hasWritableVolume
+            ? device.inputControlMap
+            : AudioHardwareControl.probeControlMap(
+                deviceID: device.id,
+                scope: kAudioDevicePropertyScopeInput,
+                channelCount: device.inputChannels
+            )
+        guard map.hasWritableVolume else { return false }
+
+        let ok = AudioHardwareControl.writeScalarVolume(
             deviceID: device.id,
             scope: kAudioDevicePropertyScopeInput,
-            channelCount: device.inputChannels,
+            elements: map.volumeElements,
             fraction: Float(clamped) / 100.0
         )
-        if clamped > 0 {
+        if ok && clamped > 0 {
             if persistPreMute {
                 savePreMuteVolume(clamped, uid: device.uid)
             }
-            if device.inputMuteControlAvailable {
+            if clearMuteIfPositive && map.hasFullHardwareMute {
                 _ = AudioHardwareControl.writeMute(
                     deviceID: device.id,
                     scope: kAudioDevicePropertyScopeInput,
-                    channelCount: device.inputChannels,
+                    elements: map.muteElements,
                     muted: false
                 )
             }
         }
+        return ok
     }
 
     @discardableResult
     static func setVolume(_ percent: Int, for device: AudioDeviceInfo) -> Status {
-        applyVolume(percent, for: device, persistPreMute: true)
+        _ = applyVolume(percent, for: device, persistPreMute: true, clearMuteIfPositive: false)
         return readStatus(for: device)
     }
 
@@ -610,30 +792,42 @@ enum MicrophoneControl {
     static func toggleMute(for device: AudioDeviceInfo) -> Status? {
         guard device.inputMuteSupported else { return nil }
         let current = readStatus(for: device)
-        let targetMuted = !current.muted
-        return setMuted(targetMuted, for: device)
+        guard current.readSucceeded else { return nil }
+        return setMuted(!current.muted, for: device)
     }
 
     @discardableResult
     static func setMuted(_ muted: Bool, for device: AudioDeviceInfo) -> Status? {
         guard device.inputMuteSupported else { return nil }
-        if device.inputMuteControlAvailable {
-            _ = AudioHardwareControl.writeMute(
+        let map = device.inputControlMap.hasWritableVolume || device.inputControlMap.hasFullHardwareMute
+            ? device.inputControlMap
+            : AudioHardwareControl.probeControlMap(
                 deviceID: device.id,
                 scope: kAudioDevicePropertyScopeInput,
-                channelCount: device.inputChannels,
+                channelCount: device.inputChannels
+            )
+
+        if map.hasFullHardwareMute {
+            let wroteAll = AudioHardwareControl.writeMute(
+                deviceID: device.id,
+                scope: kAudioDevicePropertyScopeInput,
+                elements: map.muteElements,
                 muted: muted
             )
-            return readStatus(for: device)
+            let verified = readStatus(for: device)
+            return wroteAll && verified.readSucceeded ? verified : nil
         }
 
-        // Soft-gain mute fallback for USB mics without hardware kAudioDevicePropertyMute.
-        let currentScalar = AudioHardwareControl.readScalarVolume(
-            deviceID: device.id,
-            scope: kAudioDevicePropertyScopeInput,
-            channelCount: device.inputChannels
-        )
-        let currentPct = Int(((currentScalar ?? 0.5) * 100.0).rounded())
+        // Soft-gain attenuation fallback ONLY when writable scalar gain covers ALL active input channels.
+        guard map.hasFullChannelVolume,
+              let currentScalar = AudioHardwareControl.readScalarVolume(
+                  deviceID: device.id,
+                  scope: kAudioDevicePropertyScopeInput,
+                  elements: map.volumeElements
+              ) else {
+            return nil
+        }
+        let currentPct = Int((currentScalar * 100.0).rounded())
         let plan = InputMuteMath.planSoftMute(
             currentPercent: currentPct,
             savedBeforeMute: savedPreMuteVolume(uid: device.uid),
@@ -642,13 +836,14 @@ enum MicrophoneControl {
         if let toSave = plan.updatedSavedVolume {
             savePreMuteVolume(toSave, uid: device.uid)
         }
-        _ = AudioHardwareControl.writeScalarVolume(
+        let wroteAll = AudioHardwareControl.writeScalarVolume(
             deviceID: device.id,
             scope: kAudioDevicePropertyScopeInput,
-            channelCount: device.inputChannels,
+            elements: map.volumeElements,
             fraction: Float(plan.appliedPercent) / 100.0
         )
-        return readStatus(for: device)
+        let verified = readStatus(for: device)
+        return wroteAll && verified.readSucceeded ? verified : nil
     }
 
     private static func savedPreMuteVolume(uid: String) -> Int? {

@@ -1,55 +1,46 @@
 # DisplayVolume — Project Engineering Rules (`AGENTS.md`)
 
-These rules codify the first-principles invariants learned from building and debugging `DisplayVolume` (see [`docs/RETROSPECTIVE-2026-11.md`](docs/RETROSPECTIVE-2026-11.md)). Every contributor and AI agent working in this repository MUST follow them.
+These rules codify the first-principles invariants learned from building, profiling, and peer-reviewing `DisplayVolume` (see [`docs/RETROSPECTIVE-2026-11.md`](docs/RETROSPECTIVE-2026-11.md)). Every contributor and AI agent working in this repository MUST follow them.
 
-## 1. Architecture & Process Boundaries
+## 1. Architecture, Authenticated XPC & Process Boundaries
 
 - **Two-process split is mandatory**:
-  - `DisplayVolume.app` (Menu bar UI + popover + native HAL output/input controls + primary `MediaKeyTap`).
-  - `DisplayVolumeEngine.app` (LaunchAgent background CoreAudio Process Tap + `AudioGain.c` real-time DSP + `VolumeOSD` + global `⌃⌥⇧ M` mic mute hotkey + fallback `MediaKeyTap`).
+  - `DisplayVolume.app` (Menu bar UI + popover + native HAL output controls + primary `MediaKeyTap` + Ed25519 OTA updater).
+  - `DisplayVolumeEngine.app` (LaunchAgent background CoreAudio Process Tap + `AudioGain.c` real-time DSP + `VolumeOSD` + global `⌃⌥⇧ M` mic mute hotkey + serialized single-writer microphone controller + fallback `MediaKeyTap`).
   - Quitting the UI icon must NEVER stop audio attenuation or spike external speaker volume back to 100%.
-- **Version lockstep**: `Info.plist` and `EngineInfo.plist` MUST keep identical `CFBundleShortVersionString` and `CFBundleVersion` values so `EngineProvisioner` upgrades cleanly.
+- **Authenticated Mach XPC only**: All mutating Engine commands run over `NSXPCListener` (`com.hazelkahlil.DisplayVolume.Engine.xpc`) protected by `setConnectionCodeSigningRequirement` (matching Team ID + bundle ID) and `effectiveUserIdentifier == getuid()`. Never accept commands over unauthenticated `DistributedNotificationCenter`.
+- **Single-writer microphone control**: Route microphone gain/mute mutations through `VolumeEngine` XPC so UI slider drags and global `⌃⌥⇧ M` hotkeys never race on HAL properties or `UserDefaults`.
+- **Version lockstep & transactional install**: `Info.plist` and `EngineInfo.plist` MUST match (`CFBundleShortVersionString` & `CFBundleVersion`). Engine installs/updates run under cross-process `InstallTransactionLock` (`flock`), verify full nested bundle signatures + Team ID, enforce monotonic upgrades, and preserve previous backup for automatic rollback.
 
 ## 2. State Ownership & Anti-Stutter Invariants
 
-1. **Diff-before-publish (`@Published` & Status Bar)**:
-   - NEVER assign a `@Published` property in `VolumeController` unconditionally inside timers, IPC handlers, or CoreAudio callbacks. Always use `assignIfChanged(&prop, value)` so unchanged ticks emit zero phantom `objectWillChange` events and never wake up the hidden SwiftUI `NSPopover`.
-   - Guard `NSStatusBarButton` redraws with `StatusItemRenderKey` so `MenuBarIconRenderer.makeIcon` never re-rasterizes identical icons.
-2. **Slider echo & external-update sync**:
-   - Every slider (`SmoothNativeSlider`) must sync `Coordinator.lastSentValue` on external `updateNSView` updates (when `!isTracking`) so clicking back to a previously visited value after an `F10–F12` key press or preset click is never dropped.
-   - Use optimistic settling locks (`250–300 ms`) during UI drag while allowing hardware triggers (`.mediaKey`, `.hotkey`, `.scroll`) to override immediately.
-3. **Engine watchdog silence rule**:
-   - CoreAudio legitimately pauses IOProc callbacks when no app is playing audio (`!device.isRunningSomewhere`). The watchdog MUST check `device.isAlive` and reset `lastCallbackTime` while `!device.isRunningSomewhere` — never reconnect-loop during idle silence.
-   - Distinguish `phase == .idle && isEnabled` ("Reconnecting…") from `!isEnabled` ("Paused") in the UI.
+1. **Direct compare-before-write for `@Published` (NEVER pass `@Published` as `inout`)**:
+   - In Swift, passing an `@Published` property as `inout` writes back on return even when unchanged, firing phantom `objectWillChange` events. ALWAYS write `if prop != next { prop = next }` directly at the assignment site, and keep the Combine zero-emission test passing in `--self-test`.
+   - Split menu bar `StatusIconKey` (wave tier `0..3`, `muted`, `active`) from `StatusLabelKey` so percentage drags (`51% -> 52%`) and mic mute never re-rasterize `NSImage`.
+2. **Slider session & external-update sync**:
+   - Freeze slider `minValue`/`maxValue` during active tracking, sync `Coordinator.lastSentValue` on external updates, and invalidate active gestures when `sessionKey` (device UID) changes mid-drag.
+   - Preempt optimistic state only on strictly newer `lastTriggerNonce`, and schedule a trailing reconciliation readback after drag release.
+3. **CoreAudio route lifecycle & silence watchdog**:
+   - Run `AudioRoute.start` / `stop` on `routeQueue` (never block `MainActor` inside `AudioDeviceStart`), with monotonic `routeGeneration` cancellation.
+   - Distinguish HAL disabled streams (`mData == NULL`) from real `layoutError` in `AudioGain.c`, monitor all format/sample-rate selectors, and consume both `layoutChanged` and `renderedCallbackCount` in the watchdog while resetting idle timers when `!device.isRunningSomewhere`.
+   - Track `systemSleeping` and `screensSleeping` separately so queued retries never fire while displays are asleep.
 
 ## 3. Main-Thread IPC & Real-Time Audio Budgets
 
-- **Single-pass HAL enumeration**: Always use `AudioDeviceCatalog.captureSnapshot()` to read outputs, inputs, and defaults in one scan. Never scan `allDevices()` multiple times on popover open, and debounce `kAudioHardwarePropertyDevices` bursts (`>= 60 ms`).
-- **Switch by cached `AudioDeviceID`**: Call `setDefaultOutput(deviceID:)` / `setDefaultInput(deviceID:)` directly when the ID is already in memory.
-- **Throttle continuous drag hot paths**:
-  - Software IPC drags: throttle to `>= 25 ms`, always flush on drag end.
-  - Native HAL output & microphone drags: throttle to `>= 20 ms`, always flush on drag end.
-  - NEVER write `UserDefaults` plists to disk or run trailing HAL readbacks per drag pixel — persist `savedPreMuteVolume` only on drag release or mute toggle.
-- **No per-tick TCC IPC**: Cache `AXIsProcessTrusted()` in `VolumeEngine` and refresh on launch, topology changes, accessibility polling, or explicit user request — never inside `publishState()` during 40 Hz slider drags.
-- **Non-blocking cold launch**: Run `EngineProvisioner.ensureInstalledAndRunning()` off the main thread so the status bar icon appears immediately.
-- **Real-time C DSP (`Sources/Engine/AudioGain.c`)**:
-  - Zero heap allocations, zero locks, zero Objective-C/Swift calls inside `render()`.
-  - Avoid redundant full-buffer `memset` when overwriting all frames; hoist channel base pointers out of sample loops and preserve the SIMD-vectorizable steady-state (`remaining == 0`) fast path.
+- **Single-pass HAL enumeration**: Use `AudioDeviceCatalog.captureSnapshot()`, trim returned HAL arrays strictly to actual returned byte length, preserve previous device lists on transient HAL failure, and debounce `kAudioHardwarePropertyDevices` bursts (`>= 60 ms`).
+- **Unified channel control maps**: Read, write, and observe HAL properties through the same `ChannelControlMap`. Report hardware mute `true` ONLY when EVERY mapped channel is muted, and require ALL writable channels to succeed on `writeMute`.
+- **Throttle continuous drag hot paths**: Throttle IPC drags (`>= 25 ms`) and HAL drags (`>= 20 ms`), flush final value on release, and never persist `UserDefaults` plists while `isDragging == true`.
+- **No per-tick TCC IPC**: Cache `AXIsProcessTrusted()` in `VolumeEngine`; never call it inside `publishState()`.
+- **Real-time C DSP (`Sources/Engine/AudioGain.c`)**: Zero allocations, zero locks, zero ObjC/Swift calls inside `render()`. Preserve pointer hoisting, tail-only zeroing, and SIMD steady-state fast paths.
 
-## 4. macOS Privacy, Hardware & Visual Invariants
+## 4. macOS Privacy, OTA Security & SDK Portability
 
-- **Zero mic privacy dot & zero AirPods HFP downgrade**: Microphone volume, mute, and device switching MUST use CoreAudio HAL properties only (`kAudioDevicePropertyVolumeScalar`, `kAudioDevicePropertyMute`, `kAudioHardwarePropertyDefaultInputDevice`). Never open an audio input capture stream (`AVAudioEngine`, `AVCaptureSession`, `AudioQueueNewInput`).
-- **Honest hardware capability reporting**: Always probe writable HAL properties at runtime. For auto-gain-only mics (e.g. Continuity iPhone microphone), display "Auto Gain" honestly instead of rendering a fake slider or fake mute button.
-- **SDK safety**: Build with `-warnings-as-errors` (Swift) and `-Wall -Wextra -Werror` (C17). Never use deprecated macOS 13 constants like `kAudioDeviceTransportTypeContinuityCapture` (use `Wired` / `Wireless`). Wrap macOS 26 Liquid Glass APIs (`.glassEffect`, `.buttonStyle(.glass)`) with `#if LIQUID_GLASS_SDK` (set automatically by `Scripts/build.sh` when SDK >= 26) so contributors and CI on macOS 15 / Xcode 16 compile cleanly.
-- **Liquid Glass OSD (`VolumeOSD.swift`)**: Keep a transparent `shadowInset >= 24`, `container.wantsLayer = false`, and `panel.hasShadow = false` so macOS window bounds never clip soft glass shadows into rectangular dark artifacts.
-- **Native monochrome alignment**: Default to macOS native controls, `NSPopover`, and neutral monochrome styling; keep primary controls directly visible without extra disclosure clicks.
+- **Zero mic capture stream**: DisplayVolume itself never opens an audio capture stream for microphone controls (`AVAudioEngine`, `AVCaptureSession`, `AudioQueueNewInput` are forbidden in `AudioDevice.swift`).
+- **Cryptographic OTA updates**: Every OTA manifest is Ed25519-signed over canonical JSON bytes (`OTAManifestVerifier`), checked for bundle ID, channel, architecture, `minMacOS`, expiry, monotonic `build > currentBuild`, HTTPS GitHub Release host, archive size + SHA-256, zip-slip/symlink tree audit, strict nested `codesign` + Team ID continuity, writable non-translocated target preflight, and non-playing swap guard.
+- **SDK safety**: Build with `-warnings-as-errors` (Swift) and `-Wall -Wextra -Werror` (C17). Wrap macOS 26 Liquid Glass APIs (`.glassEffect`, `.buttonStyle(.glass)`) with `#if LIQUID_GLASS_SDK`.
 
 ## 5. Mandatory Verification Before Push / PR
-
-Before committing, opening a PR, or releasing a new version, ALWAYS run:
 
 ```bash
 ./Scripts/verify.sh
 ```
-
-This enforces version lockstep, all 8 static anti-pattern guards, parallel compilation (`-warnings-as-errors`), `RunTests` (including `AudioGain.c` `GainSelfTest`), `codesign --verify --deep --strict`, `DisplayVolume --self-test`, and `--bench` latency budgets. For changes touching UI, OSD, hotkeys, or CoreAudio routing, also verify on real hardware before merging.

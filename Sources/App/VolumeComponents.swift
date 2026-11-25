@@ -38,11 +38,28 @@ struct SmoothNativeSlider: NSViewRepresentable {
     let value: Int
     let minValue: Int
     let maxValue: Int
+    let sessionKey: String
     let accessibilityTitle: String
     let onChange: (Int, Bool) -> Void
 
+    init(
+        value: Int,
+        minValue: Int,
+        maxValue: Int,
+        sessionKey: String = "",
+        accessibilityTitle: String,
+        onChange: @escaping (Int, Bool) -> Void
+    ) {
+        self.value = value
+        self.minValue = minValue
+        self.maxValue = maxValue
+        self.sessionKey = sessionKey
+        self.accessibilityTitle = accessibilityTitle
+        self.onChange = onChange
+    }
+
     func makeCoordinator() -> Coordinator {
-        Coordinator(onChange: onChange)
+        Coordinator(sessionKey: sessionKey, onChange: onChange)
     }
 
     func makeNSView(context: Context) -> NSSlider {
@@ -65,29 +82,46 @@ struct SmoothNativeSlider: NSViewRepresentable {
 
     func updateNSView(_ nsView: NSSlider, context: Context) {
         context.coordinator.onChange = onChange
-        nsView.minValue = Double(minValue)
-        nsView.maxValue = Double(maxValue)
         nsView.setAccessibilityLabel(accessibilityTitle)
+
+        // If the underlying device/route changed mid-drag, invalidate the active drag session so
+        // mouseUp never commits the old device's value onto the newly selected device.
+        if context.coordinator.sessionKey != sessionKey {
+            context.coordinator.invalidateSession(newKey: sessionKey)
+        }
+
+        // Freeze range while actively dragging to prevent thumb jumps mid-gesture.
         if !context.coordinator.isTracking {
+            nsView.minValue = Double(minValue)
+            nsView.maxValue = Double(maxValue)
             let clamped = Double(min(maxValue, max(minValue, value)))
             let rounded = Int(clamped.rounded())
             if Int(nsView.doubleValue.rounded()) != rounded {
                 nsView.doubleValue = clamped
             }
-            // Keep Coordinator in sync with external changes (F10–F12 keys, presets, HAL listeners)
-            // so dragging back to a previously visited value is never dropped as a duplicate.
             context.coordinator.syncExternalValue(rounded)
         }
     }
 
     @MainActor
     final class Coordinator: NSObject {
+        var sessionKey: String
         var onChange: (Int, Bool) -> Void
         var isTracking = false
+        private var gestureInvalidated = false
         private var lastSentValue: Int?
 
-        init(onChange: @escaping (Int, Bool) -> Void) {
+        init(sessionKey: String, onChange: @escaping (Int, Bool) -> Void) {
+            self.sessionKey = sessionKey
             self.onChange = onChange
+        }
+
+        func invalidateSession(newKey: String) {
+            sessionKey = newKey
+            if isTracking {
+                gestureInvalidated = true
+            }
+            lastSentValue = nil
         }
 
         func syncExternalValue(_ value: Int) {
@@ -95,7 +129,14 @@ struct SmoothNativeSlider: NSViewRepresentable {
         }
 
         func handleTrack(value: Int, isTracking: Bool) {
+            if isTracking && !self.isTracking {
+                gestureInvalidated = false
+            }
             self.isTracking = isTracking
+            guard !gestureInvalidated else {
+                if !isTracking { gestureInvalidated = false }
+                return
+            }
             if lastSentValue != value || !isTracking {
                 lastSentValue = value
                 onChange(value, isTracking)
@@ -103,6 +144,7 @@ struct SmoothNativeSlider: NSViewRepresentable {
         }
 
         @objc func valueChanged(_ sender: NSSlider) {
+            guard !gestureInvalidated else { return }
             let rounded = Int(sender.doubleValue.rounded())
             if lastSentValue != rounded {
                 lastSentValue = rounded

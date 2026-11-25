@@ -22,18 +22,22 @@ Before editing code, check which invariant applies:
 
 1. **Idle CPU or phantom SwiftUI redraws?**
    - Inspect `sample <PID> 2 1` and `ps -axo pid,pcpu,cputime,etime,comm`.
-   - Every `@Published` write in `VolumeController` must go through `assignIfChanged(...)`.
-   - Heartbeat timers must check `stateFile` modification time before decoding JSON and avoid calling `AXIsProcessTrusted()` when already trusted.
+   - NEVER pass `@Published` properties as `inout` (Swift copy-in/copy-out triggers `objectWillChange` even when unchanged); always compare directly (`if prop != next { prop = next }`).
+   - Run `--self-test` to verify Combine emits 0 `objectWillChange` events on identical snapshots.
 2. **Popover open lag or drag stutter?**
    - Run `./build/DisplayVolume.app/Contents/MacOS/DisplayVolume --bench`.
    - Popover open must execute at most **1** `AudioDeviceCatalog.captureSnapshot()` scan (never duplicate in `PopoverView.onAppear`).
-   - Slider drags must throttle HAL/IPC (`>= 20–25 ms`) via `DispatchThrottleMath.shouldEmit` and NEVER write `UserDefaults` plists while `isDragging == true`.
+   - Slider drags must throttle HAL/XPC (`>= 20–25 ms`) via `DispatchThrottleMath.shouldEmit` and NEVER write `UserDefaults` plists while `isDragging == true`.
+   - All mutating commands (output volume, limits, mic gain/mute, preferences, media-key leases) must flow through authenticated Mach XPC (`setConnectionCodeSigningRequirement`), never `DistributedNotificationCenter`.
    - `VolumeEngine.publishState` must use `cachedAccessibilityTrusted`, never live `AXIsProcessTrusted()`.
 3. **Slider jumping or dropped clicks?**
-   - Verify `SmoothNativeSlider.updateNSView` calls `context.coordinator.syncExternalValue(rounded)` when `!isTracking`.
-   - Verify optimistic settling locks (`250–300 ms`) cover IPC round-trip without blocking `.mediaKey`/`.hotkey`/`.scroll` triggers.
-4. **Audio drops / spurious reconnects during silence?**
-   - Check `VolumeEngine.onWatchdogTick`: silence pauses CoreAudio callbacks (`!route.device.isRunningSomewhere`); only trigger reconnect when `isAlive && isRunningSomewhere && stalled > 3.5s`.
+   - Verify `SmoothNativeSlider.updateNSView` freezes range while `isTracking`, invalidates gestures when `sessionKey` changes, and calls `context.coordinator.syncExternalValue(rounded)` when `!isTracking`.
+   - Verify optimistic settling locks (`250–300 ms`) schedule trailing reconciliation readback and only preempt on strictly newer `lastTriggerNonce`.
+4. **Audio drops / spurious reconnects / MainActor stalls?**
+   - `AudioRoute.start/stop` must run on `routeQueue` (never block MainActor inside `AudioDeviceStart`), with `mData == NULL` disabled HAL streams separated from `layoutError` in `AudioGain.c`, and watchdog consuming both `layoutChanged` and `renderedCallbackCount`.
+5. **OTA release packaging & signing (`Scripts/build_ota.sh`)**:
+   - Never commit Ed25519 private keys to the repository (read exclusively from macOS Keychain service `com.hazelkahlil.DisplayVolume.ota-signing-key`).
+   - Run `./Scripts/build_ota.sh "<release notes>"` to produce same-source `DisplayVolume-vX.Y.Z.dmg`, `DisplayVolume-vX.Y.Z-arm64.zip`, Ed25519-signed & self-verified `ota-manifest.json`, and `SHA256SUMS.txt`.
 5. **OSD dark shadow box or UI alignment glitches?**
    - Verify `VolumeOSD.swift` keeps `shadowInset >= 24`, `container.wantsLayer = false`, `p.hasShadow = false`, and `p.backgroundColor = .clear`.
 6. **Microphone control triggers orange privacy dot or degrades AirPods sound?**

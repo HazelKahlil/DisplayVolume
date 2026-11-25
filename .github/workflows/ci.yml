@@ -6,6 +6,9 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -17,14 +20,16 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Run full verification suite
         env:
           DISPLAYVOLUME_ADHOC_SIGN: "1"
         run: |
-          chmod +x Scripts/build.sh Scripts/verify.sh Scripts/package_dmg.sh
+          chmod +x Scripts/build.sh Scripts/verify.sh Scripts/package_dmg.sh Scripts/build_ota.sh
           ./Scripts/verify.sh
 
-      - name: Smoke-test DMG packaging on PR/main
+      - name: Smoke-test same-source DMG packaging
         run: ./Scripts/package_dmg.sh

@@ -1,20 +1,15 @@
 import AppKit
+import Combine
 import CoreAudio
 import CryptoKit
 import OSLog
+import ServiceManagement
 import SwiftUI
-
-@inline(__always)
-@discardableResult
-private func assignIfChanged<T: Equatable>(_ target: inout T, _ newValue: T) -> Bool {
-    guard target != newValue else { return false }
-    target = newValue
-    return true
-}
 
 @MainActor
 final class VolumeController: NSObject, ObservableObject {
-    @Published private(set) var state = VolumeIPC.read()
+    @Published private(set) var state = VolumeIPC.readCachedSnapshot()
+    @Published private(set) var xpcConnected = false
     @Published private(set) var outputDevices: [AudioDeviceInfo] = []
     @Published private(set) var currentOutputDevice: AudioDeviceInfo? = OutputDeviceCatalog.currentDefault()
     @Published private(set) var inputDevices: [AudioDeviceInfo] = []
@@ -36,6 +31,11 @@ final class VolumeController: NSObject, ObservableObject {
     @Published private(set) var inputVolumeWritable: Bool = false
     @Published private(set) var inputMuteSupported: Bool = false
     @Published private(set) var inputUsesSoftMute: Bool = false
+    @Published private(set) var inputStatusReadable: Bool = true
+
+    private let clientInstanceID = UUID().uuidString
+    private let ownIdentity = CodeSignInspector.currentProcessIdentity()
+    private var xpcConnection: NSXPCConnection?
 
     private var volumeLockUntil: TimeInterval = 0
     private var limitLockUntil: TimeInterval = 0
@@ -50,14 +50,15 @@ final class VolumeController: NSObject, ObservableObject {
     private var lastNativeOutHALSentAt: TimeInterval = 0
     private var lastInputHALSentAt: TimeInterval = 0
     private var lastFullRefreshAt: TimeInterval = 0
-    private var lastStateFileModDate: Date?
+    private var lastHandledTriggerNonce: UInt64 = 0
 
     private var heartbeat: Timer?
     private var axPollTimer: Timer?
     private var deviceListDebounceWorkItem: DispatchWorkItem?
+    private var trailingReconcileWorkItem: DispatchWorkItem?
     private var scrollAccumulator: CGFloat = 0
 
-    // CoreAudio HAL listeners for zero-latency sync with macOS System Settings & Control Center
+    // CoreAudio HAL listeners
     private var systemListenersInstalled = false
     private var systemDefaultOutBlock: AudioObjectPropertyListenerBlock?
     private var systemDefaultInBlock: AudioObjectPropertyListenerBlock?
@@ -77,13 +78,21 @@ final class VolumeController: NSObject, ObservableObject {
 
     // MARK: - Derived Output State
 
-    var phase: VolumeState.Phase { state?.phase ?? .idle }
-    var volumeLimit: Int { optimisticLimit ?? state?.volumeLimit ?? 100 }
-    var muted: Bool { optimisticMuted ?? state?.muted ?? false }
-    var volume: Int { min(volumeLimit, optimisticVolume ?? state?.volume ?? 50) }
+    /// Only treat Engine software state as applicable when its UID matches the current HAL output device.
+    private var stateMatchesCurrentOutput: Bool {
+        guard let state else { return false }
+        guard let currentUID = currentOutputDevice?.uid else { return true }
+        return state.deviceUID == currentUID
+    }
+
+    var phase: VolumeState.Phase { stateMatchesCurrentOutput ? (state?.phase ?? .idle) : .idle }
+    var volumeLimit: Int { optimisticLimit ?? (stateMatchesCurrentOutput ? state?.volumeLimit : nil) ?? 100 }
+    var muted: Bool { optimisticMuted ?? (stateMatchesCurrentOutput ? state?.muted : nil) ?? false }
+    var volume: Int { min(volumeLimit, optimisticVolume ?? (stateMatchesCurrentOutput ? state?.volume : nil) ?? 50) }
     var message: String? { state?.message }
     var shownVolume: Int { muted ? 0 : min(volume, volumeLimit) }
     var shortcutsAvailable: Bool { state?.shortcutsAvailable ?? false }
+    var micHotkeyAvailable: Bool { state?.micHotkeyAvailable ?? false }
     var mediaKeysAuthorized: Bool { uiAccessibilityTrusted || (state?.mediaKeysAuthorized ?? false) }
     var mediaKeysActive: Bool { uiMediaKeyTap.isRunning || (state?.mediaKeysActive ?? false) }
     var showOSD: Bool { state?.showOSD ?? true }
@@ -92,13 +101,16 @@ final class VolumeController: NSObject, ObservableObject {
     var deviceUID: String? { currentOutputDevice?.uid ?? state?.deviceUID }
     var deviceName: String? { currentOutputDevice?.name ?? state?.deviceName }
     var transportLabel: String? { currentOutputDevice?.transportKind.displayLabel ?? state?.transportLabel }
-    var isEngineConnected: Bool { state != nil }
-    var isControllable: Bool { state?.isControllable ?? (currentOutputDevice?.isAutoControllable ?? false) }
-    var isEnabled: Bool { state?.enabled ?? false }
+    var isEngineConnected: Bool { xpcConnected || state != nil }
+    var isControllable: Bool { currentOutputDevice?.isAutoControllable ?? (state?.isControllable ?? false) }
+    var isEnabled: Bool { stateMatchesCurrentOutput ? (state?.enabled ?? false) : false }
 
-    var isSoftwareOutputActive: Bool { phase == .active && isControllable }
+    var isSoftwareOutputActive: Bool { phase == .active && isControllable && stateMatchesCurrentOutput }
     var isNativeHardwareOutput: Bool { !isControllable && (currentOutputDevice?.volumeControlAvailable == true) }
     var canControlCurrentOutput: Bool { isSoftwareOutputActive || isNativeHardwareOutput }
+    var isPlayingOnLockedDisplay: Bool {
+        isSoftwareOutputActive && (currentOutputDevice?.isRunningSomewhere == true)
+    }
 
     var effectiveOutputVolume: Int {
         if isSoftwareOutputActive { return shownVolume }
@@ -130,7 +142,7 @@ final class VolumeController: NSObject, ObservableObject {
             object: nil,
             suspensionBehavior: .deliverImmediately
         )
-        // Event-driven listeners handle real-time sync; keep a low-cost 30s safety heartbeat.
+
         let timer = Timer(timeInterval: 30.0, target: self, selector: #selector(pollFallback), userInfo: nil, repeats: true)
         timer.tolerance = 5.0
         RunLoop.main.add(timer, forMode: .common)
@@ -138,6 +150,7 @@ final class VolumeController: NSObject, ObservableObject {
 
         installSystemAudioListeners()
         refreshAllAudioDevices(force: true)
+        connectXPC()
         syncUIMediaKeyTap()
     }
 
@@ -148,15 +161,89 @@ final class VolumeController: NSObject, ObservableObject {
         axPollTimer = nil
         deviceListDebounceWorkItem?.cancel()
         deviceListDebounceWorkItem = nil
+        trailingReconcileWorkItem?.cancel()
+        trailingReconcileWorkItem = nil
         removeSystemAudioListeners()
         if uiMediaKeyTap.isRunning {
-            VolumeIPC.send(.setUIMediaKeysActive, flag: false)
+            sendMediaKeyLease(active: false)
         }
         uiMediaKeyTap.stop()
+        xpcConnection?.invalidate()
+        xpcConnection = nil
         DistributedNotificationCenter.default().removeObserver(self)
     }
 
-    // MARK: - Device & Hardware Sync
+    // MARK: - Authenticated XPC Client
+
+    func reconnectXPC() {
+        xpcConnection?.invalidate()
+        xpcConnection = nil
+        if xpcConnected { xpcConnected = false }
+        connectXPC()
+    }
+
+    private func connectXPC() {
+        if xpcConnection != nil { return }
+        let conn = NSXPCConnection(machServiceName: VolumeIPC.xpcMachServiceName, options: [])
+        conn.remoteObjectInterface = VolumeIPC.makeXPCInterface()
+        let req = CodeSignInspector.peerCodeSigningRequirement(
+            expectedBundleID: VolumeIPC.engineBundleID,
+            matchingOwnIdentity: ownIdentity
+        )
+        conn.setCodeSigningRequirement(req)
+        conn.invalidationHandler = { [weak self, weak conn] in
+            Task { @MainActor in
+                guard let self, let conn, self.xpcConnection === conn else { return }
+                self.xpcConnection = nil
+                if self.xpcConnected { self.xpcConnected = false }
+            }
+        }
+        conn.interruptionHandler = { [weak self, weak conn] in
+            Task { @MainActor in
+                guard let self, let conn, self.xpcConnection === conn else { return }
+                if self.xpcConnected { self.xpcConnected = false }
+            }
+        }
+        conn.resume()
+        xpcConnection = conn
+        fetchStateViaXPC()
+    }
+
+    private func xpcProxy() -> DisplayVolumeEngineXPCProtocol? {
+        if xpcConnection == nil { connectXPC() }
+        return xpcConnection?.remoteObjectProxyWithErrorHandler { [weak self] _ in
+            Task { @MainActor in
+                if self?.xpcConnected == true { self?.xpcConnected = false }
+            }
+        } as? DisplayVolumeEngineXPCProtocol
+    }
+
+    func fetchStateViaXPC() {
+        xpcProxy()?.fetchState { [weak self] data in
+            Task { @MainActor in
+                guard let self else { return }
+                if let data, let decoded = VolumeIPC.decodeValidatedState(data) {
+                    if !self.xpcConnected { self.xpcConnected = true }
+                    self.applyIncomingState(decoded)
+                    if self.uiMediaKeyTap.isRunning {
+                        self.sendMediaKeyLease(active: true)
+                    }
+                }
+            }
+        }
+    }
+
+    private func sendMediaKeyLease(active: Bool) {
+        xpcProxy()?.setUIMediaKeysActive(active, clientInstanceID: clientInstanceID) { [weak self] data in
+            Task { @MainActor in
+                if let data, let decoded = VolumeIPC.decodeValidatedState(data) {
+                    self?.applyIncomingState(decoded)
+                }
+            }
+        }
+    }
+
+    // MARK: - Device & Hardware Sync (Direct Compare-Before-Write — Zero Phantom @Published Emissions)
 
     func refreshIfStale(maxAge: TimeInterval = 0.12) {
         let now = ProcessInfo.processInfo.systemUptime
@@ -165,34 +252,88 @@ final class VolumeController: NSObject, ObservableObject {
         }
     }
 
-    /// Single-pass CoreAudio HAL snapshot refresh: enumerates all devices once instead of 4x per popover open.
+    /// Single-pass CoreAudio HAL snapshot refresh: enumerates devices once and preserves last list on transient HAL error.
     func refreshAllAudioDevices(force: Bool = true) {
         let now = ProcessInfo.processInfo.systemUptime
         if !force, now - lastFullRefreshAt < 0.12 { return }
         lastFullRefreshAt = now
 
         let snapshot = AudioDeviceCatalog.captureSnapshot()
-        var changed = false
-        changed = assignIfChanged(&outputDevices, snapshot.outputDevices) || changed
-        changed = assignIfChanged(&currentOutputDevice, snapshot.defaultOutput) || changed
-        changed = assignIfChanged(&inputDevices, snapshot.inputDevices) || changed
-        changed = assignIfChanged(&currentInputDevice, snapshot.defaultInput) || changed
+        applyDeviceSnapshot(snapshot)
+    }
 
-        installNativeOutputListeners(for: snapshot.defaultOutput)
-        installInputListeners(for: snapshot.defaultInput)
-        changed = syncNativeOutputHardwareState(force: false) || changed
-        changed = syncInputHardwareState(force: false) || changed
+    /// Internal testable entry point verifying zero phantom `objectWillChange` emissions on identical snapshots.
+    func applyDeviceSnapshot(_ snapshot: AudioDeviceSnapshot) {
+        var changed = false
+        let previousOutUID = currentOutputDevice?.uid
+        let previousInUID = currentInputDevice?.uid
+
+        if snapshot.querySucceeded {
+            if outputDevices != snapshot.outputDevices {
+                outputDevices = snapshot.outputDevices
+                changed = true
+            }
+            if inputDevices != snapshot.inputDevices {
+                inputDevices = snapshot.inputDevices
+                changed = true
+            }
+        }
+        if currentOutputDevice != snapshot.defaultOutput {
+            currentOutputDevice = snapshot.defaultOutput
+            changed = true
+        }
+        if currentInputDevice != snapshot.defaultInput {
+            currentInputDevice = snapshot.defaultInput
+            changed = true
+        }
+
+        if previousOutUID != currentOutputDevice?.uid {
+            clearOutputOptimisticState()
+        }
+        if previousInUID != currentInputDevice?.uid {
+            isDraggingInput = false
+            inputLockUntil = 0
+        }
+
+        installNativeOutputListeners(for: currentOutputDevice)
+        installInputListeners(for: currentInputDevice)
+        if syncNativeOutputHardwareState(force: false) { changed = true }
+        if syncInputHardwareState(force: false) { changed = true }
         if changed {
             onChange?()
         }
     }
 
+    private func clearOutputOptimisticState() {
+        isDraggingVolume = false
+        isDraggingLimit = false
+        isDraggingNativeOut = false
+        volumeLockUntil = 0
+        limitLockUntil = 0
+        nativeOutLockUntil = 0
+        if optimisticVolume != nil { optimisticVolume = nil }
+        if optimisticLimit != nil { optimisticLimit = nil }
+        if optimisticMuted != nil { optimisticMuted = nil }
+    }
+
     func refreshOutputDevices() {
         var changed = false
-        changed = assignIfChanged(&outputDevices, OutputDeviceCatalog.allOutputDevices()) || changed
-        changed = assignIfChanged(&currentOutputDevice, OutputDeviceCatalog.currentDefault()) || changed
+        let previousOutUID = currentOutputDevice?.uid
+        let latestList = OutputDeviceCatalog.allOutputDevices()
+        let latestDef = OutputDeviceCatalog.currentDefault()
+        if !latestList.isEmpty && outputDevices != latestList {
+            outputDevices = latestList
+            changed = true
+        }
+        if currentOutputDevice != latestDef {
+            currentOutputDevice = latestDef
+            changed = true
+        }
+        if previousOutUID != currentOutputDevice?.uid {
+            clearOutputOptimisticState()
+        }
         installNativeOutputListeners(for: currentOutputDevice)
-        changed = syncNativeOutputHardwareState(force: false) || changed
+        if syncNativeOutputHardwareState(force: false) { changed = true }
         if changed {
             onChange?()
         }
@@ -200,10 +341,23 @@ final class VolumeController: NSObject, ObservableObject {
 
     func refreshInputDevices() {
         var changed = false
-        changed = assignIfChanged(&inputDevices, InputDeviceCatalog.allInputDevices()) || changed
-        changed = assignIfChanged(&currentInputDevice, InputDeviceCatalog.currentDefault()) || changed
+        let previousInUID = currentInputDevice?.uid
+        let latestList = InputDeviceCatalog.allInputDevices()
+        let latestDef = InputDeviceCatalog.currentDefault()
+        if !latestList.isEmpty && inputDevices != latestList {
+            inputDevices = latestList
+            changed = true
+        }
+        if currentInputDevice != latestDef {
+            currentInputDevice = latestDef
+            changed = true
+        }
+        if previousInUID != currentInputDevice?.uid {
+            isDraggingInput = false
+            inputLockUntil = 0
+        }
         installInputListeners(for: currentInputDevice)
-        changed = syncInputHardwareState(force: false) || changed
+        if syncInputHardwareState(force: false) { changed = true }
         if changed {
             onChange?()
         }
@@ -211,7 +365,8 @@ final class VolumeController: NSObject, ObservableObject {
 
     func refreshAccessibilityState() {
         let trusted = MediaKeyTap.isAccessibilityTrusted
-        if assignIfChanged(&uiAccessibilityTrusted, trusted) {
+        if uiAccessibilityTrusted != trusted {
+            uiAccessibilityTrusted = trusted
             onChange?()
         }
         syncUIMediaKeyTap()
@@ -220,12 +375,12 @@ final class VolumeController: NSObject, ObservableObject {
     func selectOutputDevice(uid: String) {
         let switched: Bool
         if let cached = outputDevices.first(where: { $0.uid == uid }) {
-            switched = OutputDeviceCatalog.setDefaultOutput(deviceID: cached.id)
+            switched = OutputDeviceCatalog.setDefaultOutput(deviceID: cached.id, expectedUID: cached.uid)
         } else {
             switched = OutputDeviceCatalog.setDefaultOutput(uid: uid)
         }
         if switched {
-            nativeOutLockUntil = 0
+            clearOutputOptimisticState()
             refreshOutputDevices()
         }
     }
@@ -233,11 +388,12 @@ final class VolumeController: NSObject, ObservableObject {
     func selectInputDevice(uid: String) {
         let switched: Bool
         if let cached = inputDevices.first(where: { $0.uid == uid }) {
-            switched = InputDeviceCatalog.setDefaultInput(deviceID: cached.id)
+            switched = InputDeviceCatalog.setDefaultInput(deviceID: cached.id, expectedUID: cached.uid)
         } else {
             switched = InputDeviceCatalog.setDefaultInput(uid: uid)
         }
         if switched {
+            isDraggingInput = false
             inputLockUntil = 0
             refreshInputDevices()
         }
@@ -250,21 +406,34 @@ final class VolumeController: NSObject, ObservableObject {
         guard force || (!isDraggingNativeOut && now >= nativeOutLockUntil) else { return false }
 
         var changed = false
+        let map = dev.outputControlMap
         if let scalar = AudioHardwareControl.readScalarVolume(
             deviceID: dev.id,
             scope: kAudioDevicePropertyScopeOutput,
-            channelCount: dev.outputChannels
+            elements: map.volumeElements
         ) {
-            changed = assignIfChanged(&nativeOutputVolume, Int((scalar * 100.0).rounded())) || changed
+            let pct = Int((scalar * 100.0).rounded())
+            if nativeOutputVolume != pct {
+                nativeOutputVolume = pct
+                changed = true
+            }
         }
-        if let hwMuted = AudioHardwareControl.readMute(
-            deviceID: dev.id,
-            scope: kAudioDevicePropertyScopeOutput,
-            channelCount: dev.outputChannels
-        ) {
-            changed = assignIfChanged(&nativeOutputMuted, hwMuted) || changed
+        if map.hasFullHardwareMute,
+           let hwMuted = AudioHardwareControl.readMute(
+               deviceID: dev.id,
+               scope: kAudioDevicePropertyScopeOutput,
+               elements: map.muteElements
+           ) {
+            if nativeOutputMuted != hwMuted {
+                nativeOutputMuted = hwMuted
+                changed = true
+            }
         } else {
-            changed = assignIfChanged(&nativeOutputMuted, nativeOutputVolume == 0) || changed
+            let derived = (nativeOutputVolume == 0)
+            if nativeOutputMuted != derived {
+                nativeOutputMuted = derived
+                changed = true
+            }
         }
         return changed
     }
@@ -273,26 +442,54 @@ final class VolumeController: NSObject, ObservableObject {
     private func syncInputHardwareState(force: Bool) -> Bool {
         guard let mic = currentInputDevice else {
             var changed = false
-            changed = assignIfChanged(&inputVolume, 0) || changed
-            changed = assignIfChanged(&inputMuted, false) || changed
-            changed = assignIfChanged(&inputVolumeWritable, false) || changed
-            changed = assignIfChanged(&inputMuteSupported, false) || changed
-            changed = assignIfChanged(&inputUsesSoftMute, false) || changed
+            if inputVolume != 0 { inputVolume = 0; changed = true }
+            if inputMuted != false { inputMuted = false; changed = true }
+            if inputVolumeWritable != false { inputVolumeWritable = false; changed = true }
+            if inputMuteSupported != false { inputMuteSupported = false; changed = true }
+            if inputUsesSoftMute != false { inputUsesSoftMute = false; changed = true }
+            if inputStatusReadable != true { inputStatusReadable = true; changed = true }
             return changed
         }
+        // Check drag/lock window BEFORE reading HAL so continuous drags don't pay redundant HAL reads.
         let now = ProcessInfo.processInfo.systemUptime
+        guard force || (!isDraggingInput && now >= inputLockUntil) else { return false }
+
         let status = MicrophoneControl.readStatus(for: mic)
+        return applyInputStatus(status)
+    }
+
+    @discardableResult
+    private func applyInputStatus(_ status: MicrophoneControl.Status) -> Bool {
         var changed = false
-        changed = assignIfChanged(&inputVolumeWritable, status.volumeWritable) || changed
-        changed = assignIfChanged(&inputMuteSupported, status.muteSupported) || changed
-        changed = assignIfChanged(&inputUsesSoftMute, status.usesSoftMute) || changed
-        guard force || (!isDraggingInput && now >= inputLockUntil) else { return changed }
-        changed = assignIfChanged(&inputVolume, status.volumePercent) || changed
-        changed = assignIfChanged(&inputMuted, status.muted) || changed
+        if inputVolumeWritable != status.volumeWritable { inputVolumeWritable = status.volumeWritable; changed = true }
+        if inputMuteSupported != status.muteSupported { inputMuteSupported = status.muteSupported; changed = true }
+        if inputUsesSoftMute != status.usesSoftMute { inputUsesSoftMute = status.usesSoftMute; changed = true }
+        if inputStatusReadable != status.readSucceeded { inputStatusReadable = status.readSucceeded; changed = true }
+        if status.readSucceeded {
+            if inputVolume != status.volumePercent { inputVolume = status.volumePercent; changed = true }
+            if inputMuted != status.muted { inputMuted = status.muted; changed = true }
+        }
         return changed
     }
 
-    // MARK: - CoreAudio Property Listeners
+    private func scheduleTrailingReconciliation(after delay: TimeInterval = 0.32) {
+        trailingReconcileWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.trailingReconcileWorkItem = nil
+            var changed = false
+            if self.syncNativeOutputHardwareState(force: true) { changed = true }
+            if self.syncInputHardwareState(force: true) { changed = true }
+            if !self.isDraggingVolume && !self.isDraggingLimit {
+                self.fetchStateViaXPC()
+            }
+            if changed { self.onChange?() }
+        }
+        trailingReconcileWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    // MARK: - CoreAudio Property Listeners (Unified ChannelControlMap Coverage)
 
     private func installSystemAudioListeners() {
         guard !systemListenersInstalled else { return }
@@ -358,11 +555,12 @@ final class VolumeController: NSObject, ObservableObject {
         let targetID = (device?.volumeControlAvailable == true) ? device!.id : AudioDeviceID(kAudioObjectUnknown)
         if observedNativeOutID == targetID { return }
         removeNativeOutputListeners()
-        guard targetID != kAudioObjectUnknown else { return }
+        guard targetID != kAudioObjectUnknown, let device else { return }
         observedNativeOutID = targetID
 
+        let elems = device.outputControlMap.observedElements
         for selector in [kAudioDevicePropertyVolumeScalar, kAudioDevicePropertyMute] {
-            for element: UInt32 in [0, 1, 2] {
+            for element in elems {
                 var prop = audioAddress(selector, scope: kAudioDevicePropertyScopeOutput, element: element)
                 guard AudioObjectHasProperty(targetID, &prop) else { continue }
                 let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
@@ -393,11 +591,12 @@ final class VolumeController: NSObject, ObservableObject {
         let targetID = device?.id ?? AudioDeviceID(kAudioObjectUnknown)
         if observedInputID == targetID { return }
         removeInputListeners()
-        guard targetID != kAudioObjectUnknown else { return }
+        guard targetID != kAudioObjectUnknown, let device else { return }
         observedInputID = targetID
 
+        let elems = device.inputControlMap.observedElements
         for selector in [kAudioDevicePropertyVolumeScalar, kAudioDevicePropertyMute] {
-            for element: UInt32 in [0, 1, 2] {
+            for element in elems {
                 var prop = audioAddress(selector, scope: kAudioDevicePropertyScopeInput, element: element)
                 guard AudioObjectHasProperty(targetID, &prop) else { continue }
                 let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
@@ -424,48 +623,51 @@ final class VolumeController: NSObject, ObservableObject {
         observedInputID = kAudioObjectUnknown
     }
 
-    // MARK: - Engine IPC Sync
+    // MARK: - Engine State Sync
 
     @objc private func handleStateNotification(_ notification: Notification) {
-        let latest = VolumeIPC.read(from: notification)
-        applyIncomingState(latest)
+        if let latest = VolumeIPC.readCachedSnapshot(from: notification) {
+            applyIncomingState(latest)
+        }
     }
 
-    private func applyIncomingState(_ latest: VolumeState?) {
+    func applyIncomingState(_ latest: VolumeState?) {
         let now = ProcessInfo.processInfo.systemUptime
-        let externalHardwareTrigger = latest?.lastTriggerSource == .mediaKey
-            || latest?.lastTriggerSource == .hotkey
-            || latest?.lastTriggerSource == .scroll
+        let isFreshExternalHardwareTrigger: Bool
+        if let latest, latest.lastTriggerNonce != lastHandledTriggerNonce {
+            lastHandledTriggerNonce = latest.lastTriggerNonce
+            isFreshExternalHardwareTrigger = latest.lastTriggerSource == .mediaKey
+                || latest.lastTriggerSource == .hotkey
+                || latest.lastTriggerSource == .scroll
+        } else {
+            isFreshExternalHardwareTrigger = false
+        }
 
-        if externalHardwareTrigger || (!isDraggingVolume && now >= volumeLockUntil) {
-            assignIfChanged(&optimisticVolume, nil)
-            assignIfChanged(&optimisticMuted, nil)
+        if isFreshExternalHardwareTrigger || (!isDraggingVolume && now >= volumeLockUntil) {
+            if optimisticVolume != nil { optimisticVolume = nil }
+            if optimisticMuted != nil { optimisticMuted = nil }
         }
         if !isDraggingLimit && now >= limitLockUntil {
-            assignIfChanged(&optimisticLimit, nil)
+            if optimisticLimit != nil { optimisticLimit = nil }
         }
 
-        if assignIfChanged(&state, latest) {
-            syncUIMediaKeyTap()
-            if uiMediaKeyTap.isRunning, latest?.mediaKeysActive == false {
-                VolumeIPC.send(.setUIMediaKeysActive, flag: true)
-            }
+        if state != latest {
+            state = latest
+            updateMediaKeyInterceptFlagOnly()
             onChange?()
         }
     }
 
-    func refreshFromDisk() {
-        lastStateFileModDate = (try? FileManager.default.attributesOfItem(atPath: VolumeIPC.stateFile.path)[.modificationDate]) as? Date
-        applyIncomingState(VolumeIPC.read())
+    func refreshFromEngine() {
+        if let cached = VolumeIPC.readCachedSnapshot() {
+            applyIncomingState(cached)
+        }
+        fetchStateViaXPC()
     }
 
     @objc private func pollFallback() {
-        // Fast-path: skip disk I/O and JSON decoding when engine PID is alive and state.json mtime is unchanged.
-        let currentMod = (try? FileManager.default.attributesOfItem(atPath: VolumeIPC.stateFile.path)[.modificationDate]) as? Date
-        let engineAlive = (state?.enginePID ?? 0) > 0 && kill(state!.enginePID, 0) == 0
-        if !engineAlive || currentMod == nil || currentMod != lastStateFileModDate {
-            lastStateFileModDate = currentMod
-            applyIncomingState(VolumeIPC.read())
+        if !xpcConnected {
+            fetchStateViaXPC()
         }
         if !uiAccessibilityTrusted {
             refreshAccessibilityState()
@@ -474,23 +676,29 @@ final class VolumeController: NSObject, ObservableObject {
 
     // MARK: - Media Keys & Scroll
 
+    private func updateMediaKeyInterceptFlagOnly() {
+        let shouldIntercept = isEnabled && (phase == .active || phase == .checking) && isControllable && stateMatchesCurrentOutput
+        uiMediaKeyTap.shouldIntercept = uiMediaKeyTap.isRunning && shouldIntercept
+    }
+
     private func syncUIMediaKeyTap() {
         let trusted = MediaKeyTap.isAccessibilityTrusted
-        assignIfChanged(&uiAccessibilityTrusted, trusted)
+        if uiAccessibilityTrusted != trusted {
+            uiAccessibilityTrusted = trusted
+        }
         if trusted {
             axPollTimer?.invalidate()
             axPollTimer = nil
             if !uiMediaKeyTap.isRunning {
                 if uiMediaKeyTap.start() {
-                    VolumeIPC.send(.setUIMediaKeysActive, flag: true)
+                    sendMediaKeyLease(active: true)
                 }
             }
-            let shouldIntercept = isEnabled && (phase == .active || phase == .checking) && isControllable
-            uiMediaKeyTap.shouldIntercept = uiMediaKeyTap.isRunning && shouldIntercept
+            updateMediaKeyInterceptFlagOnly()
         } else {
             if uiMediaKeyTap.isRunning {
                 uiMediaKeyTap.stop()
-                VolumeIPC.send(.setUIMediaKeysActive, flag: false)
+                sendMediaKeyLease(active: false)
             }
             startAccessibilityPollingIfNeeded()
         }
@@ -511,14 +719,21 @@ final class VolumeController: NSObject, ObservableObject {
     }
 
     private func handleMediaKeyAction(_ action: MediaKeyAction) {
-        guard phase == .active || phase == .checking else { return }
+        guard (phase == .active || phase == .checking), let uid = deviceUID else { return }
+        let replyHandler: (Data?) -> Void = { [weak self] data in
+            Task { @MainActor in
+                if let data, let decoded = VolumeIPC.decodeValidatedState(data) {
+                    self?.applyIncomingState(decoded)
+                }
+            }
+        }
         switch action {
         case .volumeUp(let fine):
-            VolumeIPC.send(.step, value: fine ? 1 : 5, source: .mediaKey)
+            xpcProxy()?.stepVolume(fine ? 1 : 5, deviceUID: uid, source: VolumeState.TriggerSource.mediaKey.rawValue, withReply: replyHandler)
         case .volumeDown(let fine):
-            VolumeIPC.send(.step, value: fine ? -1 : -5, source: .mediaKey)
+            xpcProxy()?.stepVolume(fine ? -1 : -5, deviceUID: uid, source: VolumeState.TriggerSource.mediaKey.rawValue, withReply: replyHandler)
         case .toggleMute:
-            VolumeIPC.send(.mute, source: .mediaKey)
+            xpcProxy()?.toggleOutputMute(deviceUID: uid, source: VolumeState.TriggerSource.mediaKey.rawValue, withReply: replyHandler)
         }
     }
 
@@ -531,8 +746,14 @@ final class VolumeController: NSObject, ObservableObject {
         scrollAccumulator -= CGFloat(steps) * stepThreshold
         guard steps != 0 else { return }
 
-        if isSoftwareOutputActive {
-            VolumeIPC.send(.step, value: steps * 2, source: .scroll)
+        if isSoftwareOutputActive, let uid = deviceUID {
+            xpcProxy()?.stepVolume(steps * 2, deviceUID: uid, source: VolumeState.TriggerSource.scroll.rawValue) { [weak self] data in
+                Task { @MainActor in
+                    if let data, let decoded = VolumeIPC.decodeValidatedState(data) {
+                        self?.applyIncomingState(decoded)
+                    }
+                }
+            }
         } else if isNativeHardwareOutput {
             let next = VolumeMath.applyStep(
                 currentVolume: nativeOutputVolume,
@@ -544,10 +765,45 @@ final class VolumeController: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - Output Mutations (Software + Native Hardware)
+    // MARK: - Output Mutations (Software via XPC + Native Hardware via HAL)
 
-    func enable() { VolumeIPC.send(.enable) }
-    func disable() { VolumeIPC.send(.pause) }
+    func enable() {
+        UserDefaults.standard.set(false, forKey: "UserStoppedEngine")
+        if !xpcConnected && !EngineProvisioner.isEngineProcessRunning() {
+            DispatchQueue.global(qos: .userInitiated).async {
+                EngineProvisioner.ensureInstalledAndRunning()
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.reconnectXPC()
+                    self.xpcProxy()?.setEnabled(true) { [weak self] data in
+                        Task { @MainActor in
+                            if let data, let decoded = VolumeIPC.decodeValidatedState(data) {
+                                self?.applyIncomingState(decoded)
+                            }
+                        }
+                    }
+                }
+            }
+            return
+        }
+        xpcProxy()?.setEnabled(true) { [weak self] data in
+            Task { @MainActor in
+                if let data, let decoded = VolumeIPC.decodeValidatedState(data) {
+                    self?.applyIncomingState(decoded)
+                }
+            }
+        }
+    }
+
+    func disable() {
+        xpcProxy()?.setEnabled(false) { [weak self] data in
+            Task { @MainActor in
+                if let data, let decoded = VolumeIPC.decodeValidatedState(data) {
+                    self?.applyIncomingState(decoded)
+                }
+            }
+        }
+    }
 
     func setActiveOutputVolume(_ percent: Int, isDragging: Bool = false) {
         if isSoftwareOutputActive {
@@ -566,47 +822,75 @@ final class VolumeController: NSObject, ObservableObject {
     }
 
     func setVolume(_ percent: Int, isDragging: Bool = false) {
+        guard let uid = deviceUID else { return }
         let clamped = VolumeMath.clampedVolume(percent, limit: volumeLimit)
         let now = ProcessInfo.processInfo.systemUptime
         isDraggingVolume = isDragging
         volumeLockUntil = now + 0.30
         if clamped > 0 {
-            assignIfChanged(&optimisticVolume, clamped)
-            assignIfChanged(&optimisticMuted, false)
+            if optimisticVolume != clamped { optimisticVolume = clamped }
+            if optimisticMuted != false { optimisticMuted = false }
         } else {
-            assignIfChanged(&optimisticMuted, true)
+            if optimisticMuted != true { optimisticMuted = true }
         }
         onChange?()
 
         if DispatchThrottleMath.shouldEmit(now: now, lastSentAt: lastVolumeIPCSentAt, minInterval: 0.025, isDragging: isDragging) {
             lastVolumeIPCSentAt = now
-            VolumeIPC.send(.volume, value: clamped, source: .slider)
+            xpcProxy()?.setVolume(clamped, deviceUID: uid, isDragging: isDragging, source: VolumeState.TriggerSource.slider.rawValue) { [weak self] data in
+                Task { @MainActor in
+                    if let data, let decoded = VolumeIPC.decodeValidatedState(data) {
+                        self?.applyIncomingState(decoded)
+                    }
+                }
+            }
+        }
+        if !isDragging {
+            scheduleTrailingReconciliation()
         }
     }
 
     func setVolumeLimit(_ percent: Int, isDragging: Bool = false) {
+        guard let uid = deviceUID else { return }
         let clamped = min(100, max(1, percent))
         let now = ProcessInfo.processInfo.systemUptime
         isDraggingLimit = isDragging
         limitLockUntil = now + 0.30
-        assignIfChanged(&optimisticLimit, clamped)
+        if optimisticLimit != clamped { optimisticLimit = clamped }
         if let v = optimisticVolume, v > clamped {
-            assignIfChanged(&optimisticVolume, clamped)
+            optimisticVolume = clamped
         }
         onChange?()
 
         if DispatchThrottleMath.shouldEmit(now: now, lastSentAt: lastLimitIPCSentAt, minInterval: 0.025, isDragging: isDragging) {
             lastLimitIPCSentAt = now
-            VolumeIPC.send(.limit, value: clamped)
+            xpcProxy()?.setLimit(clamped, deviceUID: uid, isDragging: isDragging) { [weak self] data in
+                Task { @MainActor in
+                    if let data, let decoded = VolumeIPC.decodeValidatedState(data) {
+                        self?.applyIncomingState(decoded)
+                    }
+                }
+            }
+        }
+        if !isDragging {
+            scheduleTrailingReconciliation()
         }
     }
 
     func toggleMute() {
+        guard let uid = deviceUID else { return }
         let now = ProcessInfo.processInfo.systemUptime
         volumeLockUntil = now + 0.25
-        assignIfChanged(&optimisticMuted, !muted)
+        let target = !muted
+        if optimisticMuted != target { optimisticMuted = target }
         onChange?()
-        VolumeIPC.send(.mute, source: .slider)
+        xpcProxy()?.toggleOutputMute(deviceUID: uid, source: VolumeState.TriggerSource.slider.rawValue) { [weak self] data in
+            Task { @MainActor in
+                if let data, let decoded = VolumeIPC.decodeValidatedState(data) {
+                    self?.applyIncomingState(decoded)
+                }
+            }
+        }
     }
 
     func setNativeOutputVolume(_ percent: Int, isDragging: Bool = false) {
@@ -615,27 +899,32 @@ final class VolumeController: NSObject, ObservableObject {
         let now = ProcessInfo.processInfo.systemUptime
         isDraggingNativeOut = isDragging
         nativeOutLockUntil = now + 0.25
-        assignIfChanged(&nativeOutputVolume, clamped)
-        assignIfChanged(&nativeOutputMuted, clamped == 0)
+        if nativeOutputVolume != clamped { nativeOutputVolume = clamped }
+        let wantMuted = (clamped == 0)
+        if nativeOutputMuted != wantMuted { nativeOutputMuted = wantMuted }
 
         if DispatchThrottleMath.shouldEmit(now: now, lastSentAt: lastNativeOutHALSentAt, minInterval: 0.020, isDragging: isDragging) {
             lastNativeOutHALSentAt = now
+            let map = dev.outputControlMap
             _ = AudioHardwareControl.writeScalarVolume(
                 deviceID: dev.id,
                 scope: kAudioDevicePropertyScopeOutput,
-                channelCount: dev.outputChannels,
+                elements: map.volumeElements,
                 fraction: Float(clamped) / 100.0
             )
-            if dev.muteControlAvailable {
+            if map.hasFullHardwareMute {
                 _ = AudioHardwareControl.writeMute(
                     deviceID: dev.id,
                     scope: kAudioDevicePropertyScopeOutput,
-                    channelCount: dev.outputChannels,
+                    elements: map.muteElements,
                     muted: clamped == 0
                 )
             }
         }
         onChange?()
+        if !isDragging {
+            scheduleTrailingReconciliation()
+        }
     }
 
     func toggleNativeOutputMute() {
@@ -643,21 +932,22 @@ final class VolumeController: NSObject, ObservableObject {
         let now = ProcessInfo.processInfo.systemUptime
         nativeOutLockUntil = now + 0.25
         let targetMuted = !nativeOutputMuted
-        assignIfChanged(&nativeOutputMuted, targetMuted)
+        if nativeOutputMuted != targetMuted { nativeOutputMuted = targetMuted }
 
-        if dev.muteControlAvailable {
+        let map = dev.outputControlMap
+        if map.hasFullHardwareMute {
             _ = AudioHardwareControl.writeMute(
                 deviceID: dev.id,
                 scope: kAudioDevicePropertyScopeOutput,
-                channelCount: dev.outputChannels,
+                elements: map.muteElements,
                 muted: targetMuted
             )
             if !targetMuted && nativeOutputVolume == 0 {
-                assignIfChanged(&nativeOutputVolume, 25)
+                nativeOutputVolume = 25
                 _ = AudioHardwareControl.writeScalarVolume(
                     deviceID: dev.id,
                     scope: kAudioDevicePropertyScopeOutput,
-                    channelCount: dev.outputChannels,
+                    elements: map.volumeElements,
                     fraction: 0.25
                 )
             }
@@ -666,14 +956,15 @@ final class VolumeController: NSObject, ObservableObject {
             _ = AudioHardwareControl.writeScalarVolume(
                 deviceID: dev.id,
                 scope: kAudioDevicePropertyScopeOutput,
-                channelCount: dev.outputChannels,
+                elements: map.volumeElements,
                 fraction: Float(applied) / 100.0
             )
         }
         onChange?()
+        scheduleTrailingReconciliation()
     }
 
-    // MARK: - Input / Microphone Mutations
+    // MARK: - Input / Microphone Mutations (Serialized Through Engine XPC Single-Writer)
 
     func setInputVolume(_ percent: Int, isDragging: Bool = false) {
         guard let mic = currentInputDevice, mic.inputVolumeControlAvailable else { return }
@@ -681,35 +972,55 @@ final class VolumeController: NSObject, ObservableObject {
         let now = ProcessInfo.processInfo.systemUptime
         isDraggingInput = isDragging
         inputLockUntil = now + 0.25
-        if clamped > 0 {
-            assignIfChanged(&inputVolume, clamped)
-            assignIfChanged(&inputMuted, false)
-        } else {
-            assignIfChanged(&inputVolume, clamped)
-            if !mic.inputMuteControlAvailable {
-                assignIfChanged(&inputMuted, true)
-            }
+        if inputVolume != clamped { inputVolume = clamped }
+        if clamped == 0 && !mic.inputMuteControlAvailable && !inputMuted {
+            inputMuted = true
         }
+        onChange?()
 
         if DispatchThrottleMath.shouldEmit(now: now, lastSentAt: lastInputHALSentAt, minInterval: 0.020, isDragging: isDragging) {
             lastInputHALSentAt = now
-            // Never write UserDefaults plist to disk on every pixel drag; persist only on drag end / discrete change.
-            MicrophoneControl.applyVolume(clamped, for: mic, persistPreMute: !isDragging)
+            let engineExplicitlyStopped = UserDefaults.standard.bool(forKey: "UserStoppedEngine")
+            if !engineExplicitlyStopped, let proxy = xpcProxy() {
+                // Single-writer invariant: always route mic writes through Engine XPC whenever Engine is enabled
+                // (launchd MachServices wakes Engine on demand, preventing any UI/Engine dual-write overlap).
+                proxy.setMicVolume(clamped, deviceUID: mic.uid, isDragging: isDragging) { [weak self] ok, data in
+                    Task { @MainActor in
+                        guard let self else { return }
+                        if ok, let data, let status = try? JSONDecoder().decode(MicrophoneControl.Status.self, from: data), !self.isDraggingInput {
+                            if self.applyInputStatus(status) { self.onChange?() }
+                        }
+                    }
+                }
+            } else if engineExplicitlyStopped && !EngineProvisioner.isEngineProcessRunning() {
+                _ = MicrophoneControl.applyVolume(clamped, for: mic, persistPreMute: !isDragging, clearMuteIfPositive: false)
+            }
         }
-        onChange?()
+        if !isDragging {
+            scheduleTrailingReconciliation()
+        }
     }
 
     func toggleInputMute(showOSD: Bool = false) {
         guard let mic = currentInputDevice, mic.inputMuteSupported else { return }
         let now = ProcessInfo.processInfo.systemUptime
         inputLockUntil = now + 0.25
-        if let updated = MicrophoneControl.toggleMute(for: mic) {
-            assignIfChanged(&inputVolume, updated.volumePercent)
-            assignIfChanged(&inputMuted, updated.muted)
-            if showOSD {
-                VolumeIPC.send(.showMicOSD)
+        let engineExplicitlyStopped = UserDefaults.standard.bool(forKey: "UserStoppedEngine")
+        if !engineExplicitlyStopped, let proxy = xpcProxy() {
+            proxy.toggleMicMute(deviceUID: mic.uid, showOSD: showOSD) { [weak self] ok, data in
+                Task { @MainActor in
+                    guard let self else { return }
+                    if ok, let data, let status = try? JSONDecoder().decode(MicrophoneControl.Status.self, from: data) {
+                        if self.applyInputStatus(status) { self.onChange?() }
+                    } else {
+                        _ = self.syncInputHardwareState(force: true)
+                        self.onChange?()
+                    }
+                }
             }
-            onChange?()
+        } else if engineExplicitlyStopped && !EngineProvisioner.isEngineProcessRunning(),
+                  let updated = MicrophoneControl.toggleMute(for: mic) {
+            if applyInputStatus(updated) { onChange?() }
         }
     }
 
@@ -727,15 +1038,24 @@ final class VolumeController: NSObject, ObservableObject {
         }
     }
 
-    func setShowOSD(_ flag: Bool) { VolumeIPC.send(.setShowOSD, flag: flag) }
-    func setShowMenuBarPercent(_ flag: Bool) { VolumeIPC.send(.setShowMenuBarPercent, flag: flag) }
-    func setScrollOnIcon(_ flag: Bool) { VolumeIPC.send(.setScrollOnIcon, flag: flag) }
+    func setShowOSD(_ flag: Bool) { sendPreference("showOSD", flag: flag) }
+    func setShowMenuBarPercent(_ flag: Bool) { sendPreference("showMenuBarPercent", flag: flag) }
+    func setScrollOnIcon(_ flag: Bool) { sendPreference("scrollOnIcon", flag: flag) }
+
+    private func sendPreference(_ key: String, flag: Bool) {
+        xpcProxy()?.setPreference(key, flag: flag) { [weak self] data in
+            Task { @MainActor in
+                if let data, let decoded = VolumeIPC.decodeValidatedState(data) {
+                    self?.applyIncomingState(decoded)
+                }
+            }
+        }
+    }
 }
 
-/// Manages installing the embedded background engine and LaunchAgent so the app works out-of-the-box for all users.
+/// Transactional, lock-protected, signature-verified LaunchAgent provisioner with automatic rollback.
 enum EngineProvisioner {
-    static let supportDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        .appendingPathComponent("DisplayVolume", isDirectory: true)
+    static let supportDir = VolumeIPC.directory
     static let installedEngineURL = supportDir.appendingPathComponent("DisplayVolumeEngine.app", isDirectory: true)
     static let launchAgentDir = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/LaunchAgents", isDirectory: true)
@@ -743,37 +1063,137 @@ enum EngineProvisioner {
     static let legacyPlistURL = launchAgentDir.appendingPathComponent("\(VolumeIPC.legacyEngineBundleID).plist")
 
     static func ensureInstalledAndRunning() {
-        cleanLegacyEngineIfPresent()
+        do {
+            try InstallTransactionLock.withExclusiveLock {
+                cleanLegacyEngineIfPresent()
 
-        guard let embeddedURL = embeddedEngineURL() else {
-            return
-        }
+                guard verifyTrustedDirectory(supportDir),
+                      let embeddedURL = embeddedEngineURL() else {
+                    return
+                }
 
-        let needsInstall = shouldUpdateInstalledEngine(embedded: embeddedURL, installed: installedEngineURL)
-        if needsInstall {
-            bootOut(label: VolumeIPC.engineBundleID, plist: plistURL)
-            terminateProcess(bundleIdentifier: VolumeIPC.engineBundleID)
-            try? FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
-            try? FileManager.default.removeItem(at: installedEngineURL)
-            do {
-                try FileManager.default.copyItem(at: embeddedURL, to: installedEngineURL)
-            } catch {
-                NSLog("Failed to install DisplayVolumeEngine: %@", error.localizedDescription)
-                return
+                // Verify embedded Engine full bundle signature + Team ID match before trusting it.
+                let ownIdentity = CodeSignInspector.currentProcessIdentity()
+                guard verifyEngineBundle(at: embeddedURL, matchingTeamOf: ownIdentity) else {
+                    NSLog("DisplayVolume: embedded DisplayVolumeEngine failed signature verification")
+                    return
+                }
+
+                let embeddedBuild = bundleBuildNumber(at: embeddedURL)
+                let installedBuild = bundleBuildNumber(at: installedEngineURL)
+
+                // Monotonic version policy: never downgrade a newer installed Engine on ordinary startup.
+                if installedBuild > embeddedBuild && verifyEngineBundle(at: installedEngineURL, matchingTeamOf: ownIdentity) {
+                    ensureLaunchAgentPlist()
+                    if !isServiceLoaded() {
+                        bootstrapLaunchAgent()
+                    }
+                    return
+                }
+
+                let needsInstall = shouldUpdateInstalledEngine(
+                    embedded: embeddedURL,
+                    installed: installedEngineURL,
+                    ownIdentity: ownIdentity
+                )
+
+                if needsInstall {
+                    try performTransactionalEngineSwap(embeddedURL: embeddedURL, ownIdentity: ownIdentity)
+                } else {
+                    ensureLaunchAgentPlist()
+                    if !isServiceLoaded() {
+                        bootstrapLaunchAgent()
+                    }
+                }
             }
-        }
-
-        ensureLaunchAgentPlist()
-        if needsInstall || VolumeIPC.read() == nil {
-            bootstrapLaunchAgent()
+        } catch {
+            NSLog("DisplayVolume EngineProvisioner failed: %@", error.localizedDescription)
         }
     }
 
     static func uninstallAndStopEngine() {
-        bootOut(label: VolumeIPC.engineBundleID, plist: plistURL)
+        try? InstallTransactionLock.withExclusiveLock {
+            _ = bootOut(label: VolumeIPC.engineBundleID, plist: plistURL)
+            terminateProcess(bundleIdentifier: VolumeIPC.engineBundleID)
+            try? FileManager.default.removeItem(at: plistURL)
+            try? FileManager.default.removeItem(at: installedEngineURL)
+        }
+    }
+
+    private static func performTransactionalEngineSwap(
+        embeddedURL: URL,
+        ownIdentity: CodeSignInspector.SigningIdentity?
+    ) throws {
+        let fm = FileManager.default
+        let stagingURL = supportDir.appendingPathComponent(".DisplayVolumeEngine-staging-\(UUID().uuidString).app", isDirectory: true)
+        let backupName = ".DisplayVolumeEngine-previous-\(UUID().uuidString).app"
+        let backupURL = supportDir.appendingPathComponent(backupName, isDirectory: true)
+        defer { try? fm.removeItem(at: stagingURL) }
+
+        // 1. Stage full copy first (old Engine keeps running undisturbed until copy & verification succeed).
+        try fm.copyItem(at: embeddedURL, to: stagingURL)
+        guard verifyEngineBundle(at: stagingURL, matchingTeamOf: ownIdentity) else {
+            throw OTAValidationError.signatureVerificationFailed("Staged DisplayVolumeEngine failed strict verification")
+        }
+
+        // 2. Stop old Engine only after new bundle is staged and verified.
+        _ = bootOut(label: VolumeIPC.engineBundleID, plist: plistURL)
         terminateProcess(bundleIdentifier: VolumeIPC.engineBundleID)
-        try? FileManager.default.removeItem(at: plistURL)
-        try? FileManager.default.removeItem(at: installedEngineURL)
+
+        // 3. Atomic swap preserving previous backup via `.withoutDeletingBackupItem` so rollback actually works.
+        let hadPrevious = fm.fileExists(atPath: installedEngineURL.path)
+        if hadPrevious {
+            _ = try fm.replaceItemAt(
+                installedEngineURL,
+                withItemAt: stagingURL,
+                backupItemName: backupName,
+                options: [.withoutDeletingBackupItem]
+            )
+        } else {
+            try fm.moveItem(at: stagingURL, to: installedEngineURL)
+        }
+
+        ensureLaunchAgentPlist()
+        let startedOK = bootstrapLaunchAgent()
+        if startedOK {
+            try? fm.removeItem(at: backupURL)
+        } else if hadPrevious && fm.fileExists(atPath: backupURL.path) {
+            // Roll back to previous working Engine on bootstrap failure.
+            NSLog("DisplayVolume: new Engine bootstrap failed; rolling back to previous Engine")
+            _ = try? fm.replaceItemAt(installedEngineURL, withItemAt: backupURL, backupItemName: nil, options: [])
+            ensureLaunchAgentPlist()
+            _ = bootstrapLaunchAgent()
+        }
+    }
+
+    static func isEngineProcessRunning() -> Bool {
+        !NSRunningApplication.runningApplications(withBundleIdentifier: VolumeIPC.engineBundleID).isEmpty
+    }
+
+    private static func verifyTrustedDirectory(_ dir: URL) -> Bool {
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var st = stat()
+        guard lstat(dir.path, &st) == 0,
+              (st.st_mode & S_IFMT) == S_IFDIR,
+              st.st_uid == getuid() else {
+            return false
+        }
+        return true
+    }
+
+    private static func verifyEngineBundle(at url: URL, matchingTeamOf ownIdentity: CodeSignInspector.SigningIdentity?) -> Bool {
+        guard let sign = CodeSignInspector.inspectBundle(at: url, verifyStrict: true),
+              sign.identifier == VolumeIPC.engineBundleID else {
+            return false
+        }
+        if let ownTeam = ownIdentity?.teamIdentifier, !ownTeam.isEmpty {
+            return sign.teamIdentifier == ownTeam
+        }
+        return true
+    }
+
+    private static func bundleBuildNumber(at url: URL) -> Int {
+        Int(Bundle(url: url)?.infoDictionary?["CFBundleVersion"] as? String ?? "0") ?? 0
     }
 
     private static func embeddedEngineURL() -> URL? {
@@ -782,12 +1202,16 @@ enum EngineProvisioner {
         return FileManager.default.fileExists(atPath: candidate.path) ? candidate : nil
     }
 
-    private static func shouldUpdateInstalledEngine(embedded: URL, installed: URL) -> Bool {
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: installed.path) else { return true }
-        let embeddedPlist = Bundle(url: embedded)?.infoDictionary
-        let installedPlist = Bundle(url: installed)?.infoDictionary
-        if (embeddedPlist?["CFBundleVersion"] as? String) != (installedPlist?["CFBundleVersion"] as? String) {
+    private static func shouldUpdateInstalledEngine(
+        embedded: URL,
+        installed: URL,
+        ownIdentity: CodeSignInspector.SigningIdentity?
+    ) -> Bool {
+        guard FileManager.default.fileExists(atPath: installed.path),
+              verifyEngineBundle(at: installed, matchingTeamOf: ownIdentity) else {
+            return true
+        }
+        if bundleBuildNumber(at: embedded) != bundleBuildNumber(at: installed) {
             return true
         }
         let bin1 = embedded.appendingPathComponent("Contents/MacOS/DisplayVolumeEngine")
@@ -803,39 +1227,46 @@ enum EngineProvisioner {
         let dict: [String: Any] = [
             "Label": VolumeIPC.engineBundleID,
             "ProgramArguments": [executablePath],
+            "MachServices": [VolumeIPC.xpcMachServiceName: true],
             "LimitLoadToSessionType": "Aqua",
             "RunAtLoad": true,
             "KeepAlive": true,
             "ThrottleInterval": 5
         ]
         try? FileManager.default.createDirectory(at: launchAgentDir, withIntermediateDirectories: true)
-        let data = try? PropertyListSerialization.data(fromPropertyList: dict, format: .xml, options: 0)
-        if let data {
+        if let data = try? PropertyListSerialization.data(fromPropertyList: dict, format: .xml, options: 0) {
             try? data.write(to: plistURL, options: .atomic)
         }
     }
 
     private static func cleanLegacyEngineIfPresent() {
         if FileManager.default.fileExists(atPath: legacyPlistURL.path) {
-            bootOut(label: VolumeIPC.legacyEngineBundleID, plist: legacyPlistURL)
+            _ = bootOut(label: VolumeIPC.legacyEngineBundleID, plist: legacyPlistURL)
             try? FileManager.default.removeItem(at: legacyPlistURL)
         }
         terminateProcess(bundleIdentifier: VolumeIPC.legacyEngineBundleID)
         terminateProcess(bundleIdentifier: "local.kahlil.RedmiVolume")
     }
 
-    private static func bootOut(label: String, plist: URL) {
-        let domain = "gui/\(getuid())"
-        _ = runLaunchctl(["bootout", "\(domain)/\(label)"])
-        _ = runLaunchctl(["bootout", domain, plist.path])
+    private static func isServiceLoaded() -> Bool {
+        let domain = "gui/\(getuid())/\(VolumeIPC.engineBundleID)"
+        return runLaunchctl(["print", domain]) == 0
     }
 
-    private static func bootstrapLaunchAgent() {
+    @discardableResult
+    private static func bootOut(label: String, plist: URL) -> Bool {
+        let domain = "gui/\(getuid())"
+        let s1 = runLaunchctl(["bootout", "\(domain)/\(label)"])
+        let s2 = runLaunchctl(["bootout", domain, plist.path])
+        return s1 == 0 || s2 == 0
+    }
+
+    @discardableResult
+    private static func bootstrapLaunchAgent() -> Bool {
         let domain = "gui/\(getuid())"
         let status = runLaunchctl(["bootstrap", domain, plistURL.path])
-        if status != 0 {
-            _ = runLaunchctl(["kickstart", "-k", "\(domain)/\(VolumeIPC.engineBundleID)"])
-        }
+        if status == 0 { return true }
+        return runLaunchctl(["kickstart", "-k", "\(domain)/\(VolumeIPC.engineBundleID)"]) == 0
     }
 
     private static func terminateProcess(bundleIdentifier: String) {
@@ -846,6 +1277,7 @@ enum EngineProvisioner {
         }
     }
 
+    /// Safely runs `/bin/launchctl` checking `task.run()` errors before waiting or reading `terminationStatus`.
     @discardableResult
     private static func runLaunchctl(_ args: [String]) -> Int32 {
         let task = Process()
@@ -853,7 +1285,12 @@ enum EngineProvisioner {
         task.arguments = args
         task.standardOutput = FileHandle.nullDevice
         task.standardError = FileHandle.nullDevice
-        try? task.run()
+        do {
+            try task.run()
+        } catch {
+            NSLog("DisplayVolume launchctl spawn failed: %@", error.localizedDescription)
+            return -1
+        }
         task.waitUntilExit()
         return task.terminationStatus
     }
@@ -862,7 +1299,14 @@ enum EngineProvisioner {
 @main
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
-    private struct StatusItemRenderKey: Equatable {
+    /// Separate icon-raster key (wave tier 0..3) from label/tooltip key so 51%->52% drags or mic mute never re-render NSImage.
+    private struct StatusIconKey: Equatable {
+        let waveTier: Int
+        let muted: Bool
+        let active: Bool
+    }
+
+    private struct StatusLabelKey: Equatable {
         let volume: Int
         let muted: Bool
         let active: Bool
@@ -871,10 +1315,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private let model = VolumeController()
+    private let updater = AppUpdater()
     private let log = Logger(subsystem: VolumeIPC.suiteName, category: "DisplayVolumeUI")
     private let popover = NSPopover()
     private var statusItem: NSStatusItem?
-    private var lastStatusRenderKey: StatusItemRenderKey?
+    private var lastIconKey: StatusIconKey?
+    private var lastLabelKey: StatusLabelKey?
     private var scrollMonitor: Any?
     private var sleepObserver: NSObjectProtocol?
 
@@ -888,7 +1334,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
         if CommandLine.arguments.contains("--engine-status") {
-            guard let state = VolumeIPC.read() else {
+            guard let state = VolumeIPC.readCachedSnapshot() else {
                 print("Audio engine unavailable")
                 exit(1)
             }
@@ -911,7 +1357,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if let currentIn {
                 let micStatus = MicrophoneControl.readStatus(for: currentIn)
                 print("Default input: \(currentIn.name) (\(currentIn.transportKind.displayLabel))")
-                print("  Input volume: \(micStatus.volumePercent)% (writable=\(micStatus.volumeWritable)), muted=\(micStatus.muted) (muteSupported=\(micStatus.muteSupported), softMute=\(micStatus.usesSoftMute))")
+                print("  Input volume: \(micStatus.volumePercent)% (writable=\(micStatus.volumeWritable)), muted=\(micStatus.muted) (muteSupported=\(micStatus.muteSupported), softMute=\(micStatus.usesSoftMute), readable=\(micStatus.readSucceeded))")
             } else {
                 print("Default input: None")
             }
@@ -943,6 +1389,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         popover.contentViewController = NSHostingController(
             rootView: PopoverView(
                 model: model,
+                updater: updater,
                 onHideIcon: { NSApp.terminate(nil) },
                 onQuitAll: { [weak self] in self?.quitCompletely() },
                 sizeChanged: { [weak self] size in
@@ -963,14 +1410,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         model.onChange = { [weak self] in self?.updateStatusItemAppearance() }
         model.beginMonitoring()
-        model.refreshFromDisk()
+        model.refreshFromEngine()
         updateStatusItemAppearance()
+        updater.startScheduledChecks()
 
-        // Provision / update embedded LaunchAgent engine off the main thread so menu bar icon appears immediately.
-        DispatchQueue.global(qos: .userInitiated).async {
-            EngineProvisioner.ensureInstalledAndRunning()
-            DispatchQueue.main.async { [weak self] in
-                self?.model.refreshFromDisk()
+        // Provision / upgrade embedded LaunchAgent engine off the main thread unless user explicitly stopped it.
+        let userStopped = UserDefaults.standard.bool(forKey: "UserStoppedEngine")
+        if !userStopped {
+            DispatchQueue.global(qos: .userInitiated).async {
+                EngineProvisioner.ensureInstalledAndRunning()
+                DispatchQueue.main.async { [weak self] in
+                    self?.model.reconnectXPC()
+                }
             }
         }
 
@@ -990,7 +1441,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             MainActor.assumeIsolated { self?.closePopover() }
         }
 
-        if CommandLine.arguments.contains("--open-popover") || (model.isControllable && model.phase != .active) {
+        if CommandLine.arguments.contains("--open-popover") || (model.isControllable && model.phase != .active && !userStopped) {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
                 self?.showPopover()
             }
@@ -1004,6 +1455,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         closePopover()
+        updater.stopScheduledChecks()
         if let scrollMonitor { NSEvent.removeMonitor(scrollMonitor) }
         scrollMonitor = nil
         NotificationCenter.default.removeObserver(self)
@@ -1045,8 +1497,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if popover.isShown {
             closePopover()
         } else {
-            model.refreshFromDisk()
-            model.refreshAllAudioDevices()
+            model.refreshFromEngine()
+            model.refreshAllAudioDevices(force: true)
             model.refreshAccessibilityState()
             showPopover()
         }
@@ -1054,7 +1506,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private func showQuickContextMenu(_ button: NSStatusBarButton) {
         closePopover()
-        model.refreshAllAudioDevices()
+        model.refreshAllAudioDevices(force: true)
 
         let menu = NSMenu()
         if model.canControlCurrentOutput {
@@ -1103,8 +1555,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private func quitCompletely() {
         closePopover()
-        EngineProvisioner.uninstallAndStopEngine()
-        NSApp.terminate(nil)
+        UserDefaults.standard.set(true, forKey: "UserStoppedEngine")
+        DispatchQueue.global(qos: .userInitiated).async {
+            EngineProvisioner.uninstallAndStopEngine()
+            DispatchQueue.main.async {
+                NSApp.terminate(nil)
+            }
+        }
     }
 
     private func showPopover() {
@@ -1133,35 +1590,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         popover.contentSize = size
     }
 
+    private static func iconWaveTier(volume: Int, muted: Bool, active: Bool) -> Int {
+        guard active else { return 2 }
+        if muted || volume <= 0 { return 0 }
+        if volume < 34 { return 1 }
+        if volume < 68 { return 2 }
+        return 3
+    }
+
     private func updateStatusItemAppearance() {
         guard let button = statusItem?.button else { return }
         let outActive = model.canControlCurrentOutput
-        let renderKey = StatusItemRenderKey(
-            volume: model.effectiveOutputVolume,
-            muted: model.effectiveOutputMuted,
+        let vol = model.effectiveOutputVolume
+        let outMuted = model.effectiveOutputMuted
+
+        let iconKey = StatusIconKey(
+            waveTier: Self.iconWaveTier(volume: vol, muted: outMuted, active: outActive),
+            muted: outMuted,
+            active: outActive
+        )
+        if iconKey != lastIconKey {
+            lastIconKey = iconKey
+            button.image = MenuBarIconRenderer.makeIcon(
+                volume: vol,
+                muted: outMuted,
+                active: outActive
+            )
+        }
+
+        let labelKey = StatusLabelKey(
+            volume: vol,
+            muted: outMuted,
             active: outActive,
             showPercent: model.showMenuBarPercent,
             inputMuted: model.inputMuted
         )
-        guard renderKey != lastStatusRenderKey else { return }
-        lastStatusRenderKey = renderKey
+        guard labelKey != lastLabelKey else { return }
+        lastLabelKey = labelKey
 
         let baseLabel = outActive
-            ? (renderKey.muted ? L10n.mutedLabel : "\(L10n.appName) \(renderKey.volume)%")
+            ? (labelKey.muted ? L10n.mutedLabel : "\(L10n.appName) \(labelKey.volume)%")
             : L10n.appName
-        let fullLabel = renderKey.inputMuted
+        let fullLabel = labelKey.inputMuted
             ? "\(baseLabel) · \(L10n.micMutedOSDLabel)"
             : baseLabel
 
-        let image = MenuBarIconRenderer.makeIcon(
-            volume: renderKey.volume,
-            muted: renderKey.muted,
-            active: outActive
-        )
-        button.image = image
-        button.imagePosition = renderKey.showPercent && outActive ? .imageLeading : .imageOnly
-        if renderKey.showPercent && outActive {
-            let text = renderKey.muted ? L10n.mutedLabel : "\(renderKey.volume)%"
+        button.imagePosition = labelKey.showPercent && outActive ? .imageLeading : .imageOnly
+        if labelKey.showPercent && outActive {
+            let text = labelKey.muted ? L10n.mutedLabel : "\(labelKey.volume)%"
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .medium)
             ]
@@ -1175,12 +1651,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 }
 
 private func runLatencyBenchmark() {
-    let iterations = 5
+    let coldStart = CFAbsoluteTimeGetCurrent()
+    let coldSnap = AudioDeviceCatalog.captureSnapshot()
+    let coldMs = (CFAbsoluteTimeGetCurrent() - coldStart) * 1000.0
+
+    let iterations = 6
     var snapshotTimes: [Double] = []
     var ipcTimes: [Double] = []
-
-    // Warm up CoreAudio HAL proxy map once before measuring steady-state latency.
-    _ = AudioDeviceCatalog.captureSnapshot()
 
     for _ in 0..<iterations {
         let t0 = CFAbsoluteTimeGetCurrent()
@@ -1188,20 +1665,24 @@ private func runLatencyBenchmark() {
         snapshotTimes.append((CFAbsoluteTimeGetCurrent() - t0) * 1000.0)
 
         let t1 = CFAbsoluteTimeGetCurrent()
-        _ = VolumeIPC.read()
+        _ = VolumeIPC.readCachedSnapshot()
         ipcTimes.append((CFAbsoluteTimeGetCurrent() - t1) * 1000.0)
     }
 
     let snapAvg = snapshotTimes.reduce(0, +) / Double(iterations)
+    let snapMax = snapshotTimes.max() ?? 0
     let ipcAvg = ipcTimes.reduce(0, +) / Double(iterations)
-    print(String(format: "BENCH single-pass HAL snapshot avg=%.2f ms (budget <= 50.00 ms)", snapAvg))
-    print(String(format: "BENCH VolumeIPC.read()         avg=%.2f ms (budget <= 10.00 ms)", ipcAvg))
-    let pass = snapAvg <= 50.0 && ipcAvg <= 10.0
+    print(String(format: "BENCH cold HAL snapshot         = %.2f ms (queryOK=%@)", coldMs, coldSnap.querySucceeded ? "true" : "false"))
+    print(String(format: "BENCH warm HAL snapshot avg/max = %.2f / %.2f ms (budget <= 50.00 ms)", snapAvg, snapMax))
+    print(String(format: "BENCH VolumeIPC cached read avg = %.2f ms (budget <= 10.00 ms)", ipcAvg))
+    let pass = coldSnap.querySucceeded && snapAvg <= 50.0 && ipcAvg <= 10.0
     print(pass ? "PASS latency budget" : "FAIL latency budget exceeded")
     exit(pass ? 0 : 1)
 }
 
+@MainActor
 private func runSelfTestSuite() {
+    // 1. Core volume & overflow math
     let clamped1 = VolumeMath.clampedVolume(95, limit: 80) == 80
     let clamped2 = VolumeMath.clampedVolume(-5, limit: 80) == 0
     let step1 = VolumeMath.applyStep(currentVolume: 60, limit: 80, muted: false, delta: 5) == (65, false)
@@ -1209,12 +1690,26 @@ private func runSelfTestSuite() {
     let step3 = VolumeMath.applyStep(currentVolume: 3, limit: 100, muted: false, delta: -5) == (3, true)
     let step4 = VolumeMath.applyStep(currentVolume: 3, limit: 100, muted: true, delta: 5) == (3, false)
     let step5 = VolumeMath.applyStep(currentVolume: 40, limit: 100, muted: true, delta: -5) == (40, true)
+    let stepOverflowPos = VolumeMath.applyStep(currentVolume: 50, limit: 80, muted: false, delta: Int.max) == (80, false)
+    let stepOverflowNeg = VolumeMath.applyStep(currentVolume: 50, limit: 80, muted: false, delta: Int.min) == (50, true)
     let mic1 = InputMuteMath.planSoftMute(currentPercent: 85, savedBeforeMute: nil, targetMuted: true)
         == .init(appliedPercent: 0, updatedSavedVolume: 85)
     let mic2 = InputMuteMath.planSoftMute(currentPercent: 0, savedBeforeMute: 85, targetMuted: false)
         == .init(appliedPercent: 85, updatedSavedVolume: 85)
 
-    let ok = clamped1 && clamped2 && step1 && step2 && step3 && step4 && step5 && mic1 && mic2
-    print(ok ? "PASS app volume & microphone math tests" : "FAIL app volume & microphone math tests")
+    // 2. Verify Combine objectWillChange produces ZERO phantom emissions on identical state/snapshot!
+    let ctrl = VolumeController()
+    let snap = AudioDeviceSnapshot(outputDevices: [], inputDevices: [], defaultOutput: nil, defaultInput: nil, querySucceeded: true)
+    ctrl.applyDeviceSnapshot(snap)
+    var emissions = 0
+    let cancellable = ctrl.objectWillChange.sink { emissions += 1 }
+    ctrl.applyDeviceSnapshot(snap)
+    ctrl.applyIncomingState(ctrl.state)
+    cancellable.cancel()
+    let zeroPhantomRedraws = (emissions == 0)
+
+    let ok = clamped1 && clamped2 && step1 && step2 && step3 && step4 && step5
+        && stepOverflowPos && stepOverflowNeg && mic1 && mic2 && zeroPhantomRedraws
+    print(ok ? "PASS app volume, overflow, microphone & zero-phantom-publish tests" : "FAIL self-test (phantom emissions=\(emissions))")
     exit(ok ? 0 : 1)
 }

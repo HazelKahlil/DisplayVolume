@@ -5,7 +5,7 @@ import Foundation
 import IOKit.hidsystem
 import os
 
-enum MediaKeyAction: Equatable {
+enum MediaKeyAction: Equatable, Sendable {
     case volumeUp(fine: Bool)
     case volumeDown(fine: Bool)
     case toggleMute
@@ -18,7 +18,7 @@ enum MediaKeyParser {
     static let soundDownKey: Int = Int(NX_KEYTYPE_SOUND_DOWN)
     static let muteKey: Int = Int(NX_KEYTYPE_MUTE)
 
-    struct ParsedEvent: Equatable {
+    struct ParsedEvent: Equatable, Sendable {
         let action: MediaKeyAction
         let isKeyDown: Bool
         let isRepeat: Bool
@@ -41,7 +41,6 @@ enum MediaKeyParser {
         }
 
         let mods = modifierFlags.intersection([.shift, .control, .option, .command])
-        // Pass Command/Control shortcuts and pure Option+Volume (opens Sound Settings) straight through.
         if mods.contains(.command) || mods.contains(.control) || mods == [.option] {
             return nil
         }
@@ -59,15 +58,25 @@ enum MediaKeyParser {
     }
 }
 
-/// Thread-isolated CGEventTap for hardware Magic Keyboard / MacBook F10-F12 volume keys.
-/// Evaluates `shouldIntercept` lock-free and never blocks on MainActor or disk I/O inside the tap callback.
+/// Thread-isolated, Swift-6-safe CGEventTap for hardware Magic Keyboard / MacBook F10–F12 volume keys.
+/// Uses generation tokens to discard stale events after stop/restart and avoids stop-before-CFRunLoopRun races.
 final class MediaKeyTap: @unchecked Sendable {
-    private let interceptLock = OSAllocatedUnfairLock(initialState: false)
-    private let stateLock = NSLock()
-    private var thread: Thread?
-    private var runLoop: CFRunLoop?
-    private var tapPort: CFMachPort?
-    private var runLoopSource: CFRunLoopSource?
+    private struct InterceptState {
+        var shouldIntercept: Bool = false
+        var generation: UInt64 = 0
+    }
+
+    private struct LifecycleState {
+        var generation: UInt64 = 0
+        var runLoop: CFRunLoop?
+        var tapPort: CFMachPort?
+        var runLoopSource: CFRunLoopSource?
+        var stopRequested: Bool = false
+        var isStarting: Bool = false
+    }
+
+    private let interceptState = OSAllocatedUnfairLock(initialState: InterceptState())
+    private let lifecycle = OSAllocatedUnfairLock(initialState: LifecycleState())
     private let onAction: @MainActor (MediaKeyAction) -> Void
 
     init(onAction: @escaping @MainActor (MediaKeyAction) -> Void) {
@@ -89,34 +98,48 @@ final class MediaKeyTap: @unchecked Sendable {
     }
 
     var shouldIntercept: Bool {
-        get { interceptLock.withLock { $0 } }
-        set { interceptLock.withLock { $0 = newValue } }
+        get { interceptState.withLock { $0.shouldIntercept } }
+        set { interceptState.withLock { $0.shouldIntercept = newValue } }
     }
 
     var isRunning: Bool {
-        stateLock.withLock { tapPort != nil }
+        lifecycle.withLock { state in
+            guard let port = state.tapPort, !state.stopRequested else { return false }
+            return CFMachPortIsValid(port) && CGEvent.tapIsEnabled(tap: port)
+        }
     }
 
-    /// Attempts to start the active session event tap. Returns true if active interception is running.
+    /// Starts the active session event tap on a dedicated high-priority thread with bounded wait.
     @discardableResult
     func start() -> Bool {
-        stateLock.lock()
-        if tapPort != nil {
-            stateLock.unlock()
-            return true
-        }
-        stateLock.unlock()
-
+        if isRunning { return true }
         guard Self.isAccessibilityTrusted else { return false }
 
+        let targetGen: UInt64? = lifecycle.withLock { state in
+            if state.isStarting { return nil }
+            if let port = state.tapPort, CFMachPortIsValid(port), !state.stopRequested {
+                return nil
+            }
+            state.generation &+= 1
+            state.stopRequested = false
+            state.isStarting = true
+            return state.generation
+        }
+
+        guard let gen = targetGen else {
+            return isRunning
+        }
+
+        interceptState.withLock { $0.generation = gen }
         let ready = DispatchSemaphore(value: 0)
-        var created = false
+        let startedFlag = OSAllocatedUnfairLock(initialState: false)
 
         let worker = Thread { [weak self] in
             guard let self else {
                 ready.signal()
                 return
             }
+
             let mask = CGEventMask(1 << MediaKeyParser.systemDefinedTypeRawValue)
             let userInfo = Unmanaged.passUnretained(self).toOpaque()
             guard let port = CGEvent.tapCreate(
@@ -127,75 +150,104 @@ final class MediaKeyTap: @unchecked Sendable {
                 callback: Self.tapCallback,
                 userInfo: userInfo
             ) else {
+                self.lifecycle.withLock { state in
+                    if state.generation == gen {
+                        state.isStarting = false
+                    }
+                }
                 ready.signal()
                 return
             }
 
             let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, port, 0)
             let loop = CFRunLoopGetCurrent()
+            let shouldAbortImmediately: Bool = self.lifecycle.withLock { state in
+                guard state.generation == gen && !state.stopRequested else { return true }
+                state.tapPort = port
+                state.runLoopSource = source
+                state.runLoop = loop
+                state.isStarting = false
+                return false
+            }
 
-            self.stateLock.withLock {
-                self.tapPort = port
-                self.runLoopSource = source
-                self.runLoop = loop
+            if shouldAbortImmediately {
+                CFMachPortInvalidate(port)
+                ready.signal()
+                return
             }
 
             CFRunLoopAddSource(loop, source, .commonModes)
             CGEvent.tapEnable(tap: port, enable: true)
-            created = true
+            startedFlag.withLock { $0 = true }
             ready.signal()
 
-            CFRunLoopRun()
+            // Guard against stop() arriving right after ready.signal() before CFRunLoopRun() enters.
+            while true {
+                let cancelled = self.lifecycle.withLock { $0.generation != gen || $0.stopRequested }
+                if cancelled { break }
+                CFRunLoopRunInMode(.defaultMode, 0.25, false)
+            }
 
-            self.stateLock.withLock {
-                if let src = self.runLoopSource {
-                    CFRunLoopRemoveSource(loop, src, .commonModes)
+            // Always clean up local port/source deterministically inside worker thread.
+            if let source {
+                CFRunLoopRemoveSource(loop, source, .commonModes)
+            }
+            CGEvent.tapEnable(tap: port, enable: false)
+            CFMachPortInvalidate(port)
+
+            self.lifecycle.withLock { state in
+                if state.generation == gen {
+                    state.tapPort = nil
+                    state.runLoopSource = nil
+                    state.runLoop = nil
+                    state.isStarting = false
                 }
-                if let p = self.tapPort {
-                    CFMachPortInvalidate(p)
-                }
-                self.tapPort = nil
-                self.runLoopSource = nil
-                self.runLoop = nil
             }
         }
-        worker.name = "com.hazelkahlil.DisplayVolume.MediaKeyTap"
+        worker.name = "com.hazelkahlil.DisplayVolume.MediaKeyTap.\(gen)"
         worker.qualityOfService = .userInteractive
-        stateLock.withLock { self.thread = worker }
         worker.start()
-        ready.wait()
 
-        if !created {
-            stateLock.withLock { self.thread = nil }
+        // Bounded 1.0s startup wait so main thread never deadlocks under heavy system load.
+        let waitResult = ready.wait(timeout: .now() + 1.0)
+        if waitResult == .timedOut {
+            return isRunning
         }
-        return created
+        return startedFlag.withLock { $0 }
     }
 
     func stop() {
-        let loop: CFRunLoop? = stateLock.withLock {
-            let current = runLoop
-            runLoop = nil
+        let loopToStop: CFRunLoop? = lifecycle.withLock { state in
+            state.stopRequested = true
+            state.generation &+= 1
+            let current = state.runLoop
+            state.runLoop = nil
             return current
         }
-        if let loop {
-            CFRunLoopStop(loop)
+        interceptState.withLock { state in
+            state.shouldIntercept = false
+            state.generation &+= 1
         }
-        stateLock.withLock {
-            thread = nil
+        if let loopToStop {
+            CFRunLoopStop(loopToStop)
         }
     }
 
     private func handleEvent(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            let port = stateLock.withLock { tapPort }
-            if let port {
+            let port = lifecycle.withLock { state -> CFMachPort? in
+                guard !state.stopRequested else { return nil }
+                return state.tapPort
+            }
+            if let port, CFMachPortIsValid(port) {
                 CGEvent.tapEnable(tap: port, enable: true)
             }
             return Unmanaged.passUnretained(event)
         }
 
+        let (active, gen) = interceptState.withLock { ($0.shouldIntercept, $0.generation) }
         guard type.rawValue == MediaKeyParser.systemDefinedTypeRawValue,
-              interceptLock.withLock({ $0 }),
+              active,
               let nsEvent = NSEvent(cgEvent: event),
               let parsed = MediaKeyParser.parse(
                   subtype: nsEvent.subtype.rawValue,
@@ -206,11 +258,12 @@ final class MediaKeyTap: @unchecked Sendable {
         }
 
         if parsed.isKeyDown {
-            // Avoid rapid mute toggling when holding down F10/Mute.
             if parsed.action != .toggleMute || !parsed.isRepeat {
                 let action = parsed.action
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
+                    let current = self.interceptState.withLock { ($0.shouldIntercept, $0.generation) }
+                    guard current.0 && current.1 == gen else { return }
                     MainActor.assumeIsolated {
                         self.onAction(action)
                     }
@@ -218,7 +271,6 @@ final class MediaKeyTap: @unchecked Sendable {
             }
         }
 
-        // Swallow both keyDown and keyUp so macOS never displays the locked-speaker OSD bezel.
         return nil
     }
 

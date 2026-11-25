@@ -1,14 +1,27 @@
 import AppKit
 import CoreAudio
+import Foundation
 
 @MainActor
-private final class VolumeEngine: NSObject, NSApplicationDelegate {
+private final class VolumeEngine: NSObject, NSApplicationDelegate, NSXPCListenerDelegate {
     private let preferences = UserDefaults(suiteName: VolumeIPC.suiteName)!
     private let osd = VolumeOSD()
+    private let routeQueue = DispatchQueue(label: "com.hazelkahlil.DisplayVolume.AudioRoute", qos: .userInitiated)
+    private let engineInstanceID = UUID().uuidString
+    private let engineBuild: Int = Int(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "0") ?? 0
+    private let ownIdentity = CodeSignInspector.currentProcessIdentity()
+
+    private var xpcListener: NSXPCListener?
+    private var activeMediaKeyClients: Set<String> = []
+    private var connectionClientMap: [ObjectIdentifier: String] = [:]
 
     private var device: AudioDeviceInfo? = OutputDeviceCatalog.currentDefault()
     private var phase = VolumeState.Phase.idle
     private var route: AudioRoute?
+    private var routeGeneration: UInt64 = 0
+    private var inFlightRouteGeneration: UInt64?
+    private var unsupportedFormatDeviceUID: String?
+    private var consecutiveRouteFailures = 0
     private var profiles: [String: DeviceVolumeProfile] = [:]
 
     private var volume: Int = 50
@@ -20,13 +33,14 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
     private var showMenuBarPercent: Bool = false
     private var scrollOnIconEnabled: Bool = true
 
-    private var shortcuts = false
+    private var outputHotkeysAvailable = false
+    private var micHotkeyAvailable = false
     private var cachedAccessibilityTrusted = MediaKeyTap.isAccessibilityTrusted
     private var mediaKeysActive = false
-    private var uiHandlesMediaKeys = false
     private var message: String?
     private var lastTriggerSource: VolumeState.TriggerSource?
     private var lastTriggerNonce: UInt64 = 0
+    private var stateSequence: UInt64 = 0
 
     private var checkingTimer: Timer?
     private var watchdogTimer: Timer?
@@ -43,12 +57,21 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
     private var devicesListListener: AudioObjectPropertyListenerBlock?
     private var workspaceObservers: [NSObjectProtocol] = []
 
-    private var sleeping = false
+    private var systemSleeping = false
+    private var screensSleeping = false
     private var retryAfter: TimeInterval = 0
     private var runningWithZeroSignalSince: TimeInterval?
     private var callbackCount: UInt32 = 0
+    private var renderedCallbackCount: UInt32 = 0
     private var lastCallbackTime: TimeInterval = 0
     private var lastPublishedState: VolumeState?
+
+    private var uiHandlesMediaKeys: Bool { !activeMediaKeyClients.isEmpty }
+    private var isAsleepForCurrentDevice: Bool {
+        if systemSleeping { return true }
+        if screensSleeping && device?.transportKind.isExternalDisplayOrDigital == true { return true }
+        return false
+    }
 
     private lazy var mediaKeyTap = MediaKeyTap { [weak self] action in
         self?.handleMediaKey(action)
@@ -57,10 +80,10 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
     private lazy var hotkeys = Hotkeys { [weak self] key in
         guard let self else { return }
         if key == 4 {
-            self.toggleDefaultMicMute(showHUD: true)
+            _ = self.toggleDefaultMicMute(expectedUID: nil, showHUD: true)
             return
         }
-        guard self.phase == .active else { return }
+        guard self.phase == .active || self.phase == .checking else { return }
         switch key {
         case 1: self.applyStep(5, source: .hotkey)
         case 2: self.applyStep(-5, source: .hotkey)
@@ -75,20 +98,13 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        DistributedNotificationCenter.default().addObserver(
-            self,
-            selector: #selector(receive(_:)),
-            name: VolumeIPC.command,
-            object: nil,
-            suspensionBehavior: .deliverImmediately
-        )
-
+        startXPCListener()
         installWorkspaceObservers()
         installSystemAudioListeners()
-        _ = hotkeys.registerMicMute()
+        micHotkeyAvailable = hotkeys.registerMicMute()
 
-        // Start media key tap immediately if Accessibility is already trusted.
-        if MediaKeyTap.isAccessibilityTrusted {
+        cachedAccessibilityTrusted = MediaKeyTap.isAccessibilityTrusted
+        if cachedAccessibilityTrusted {
             _ = mediaKeyTap.start()
             mediaKeysActive = mediaKeyTap.isRunning
         }
@@ -108,14 +124,225 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
         stopTimers()
         accessibilityPollTimer?.invalidate()
         accessibilityPollTimer = nil
-        dropRoute()
+        dropRoute(sync: true)
         hotkeys.unregisterAll()
         mediaKeyTap.stop()
         removeSystemAudioListeners()
-        DistributedNotificationCenter.default().removeObserver(self)
+        xpcListener?.invalidate()
+        xpcListener = nil
         let nc = NSWorkspace.shared.notificationCenter
         for token in workspaceObservers { nc.removeObserver(token) }
         workspaceObservers.removeAll()
+    }
+
+    // MARK: - Authenticated Mach XPC Server
+
+    private func startXPCListener() {
+        let listener = NSXPCListener(machServiceName: VolumeIPC.xpcMachServiceName)
+        listener.delegate = self
+        let req = CodeSignInspector.peerCodeSigningRequirement(
+            expectedBundleID: VolumeIPC.suiteName,
+            matchingOwnIdentity: ownIdentity
+        )
+        listener.setConnectionCodeSigningRequirement(req)
+        listener.resume()
+        xpcListener = listener
+    }
+
+    nonisolated func listener(_ listener: NSXPCListener, shouldAcceptNewConnection newConnection: NSXPCConnection) -> Bool {
+        // Enforce same-user UID boundary in addition to XPC code-signing requirement.
+        guard newConnection.effectiveUserIdentifier == getuid() else {
+            return false
+        }
+        newConnection.exportedInterface = VolumeIPC.makeXPCInterface()
+        let proxy = EngineXPCProxy(engine: self, connection: newConnection)
+        newConnection.exportedObject = proxy
+        let connID = ObjectIdentifier(newConnection)
+        newConnection.invalidationHandler = { [weak self] in
+            Task { @MainActor in
+                self?.handleXPCDisconnect(connID)
+            }
+        }
+        newConnection.interruptionHandler = { [weak self] in
+            Task { @MainActor in
+                self?.handleXPCDisconnect(connID)
+            }
+        }
+        newConnection.resume()
+        return true
+    }
+
+    private func handleXPCDisconnect(_ connID: ObjectIdentifier) {
+        if let clientID = connectionClientMap.removeValue(forKey: connID) {
+            activeMediaKeyClients.remove(clientID)
+            syncMediaKeyIntercept()
+            publishState(writeDisk: false)
+        }
+    }
+
+    fileprivate func currentEncodedState() -> Data? {
+        let state = buildStateSnapshot()
+        return try? JSONEncoder().encode(state)
+    }
+
+    fileprivate func xpcPing() -> (Int, Int, String) {
+        (engineBuild, VolumeState.currentProtocolVersion, engineInstanceID)
+    }
+
+    fileprivate func xpcSetVolume(_ value: Int, deviceUID: String, isDragging: Bool, sourceRaw: String) -> Data? {
+        guard phase == .active || phase == .checking,
+              deviceUID.isEmpty || device?.uid == deviceUID else {
+            return currentEncodedState()
+        }
+        let source = VolumeState.TriggerSource(rawValue: sourceRaw) ?? .slider
+        setAbsoluteVolume(value, source: source, deferPersistence: isDragging)
+        return currentEncodedState()
+    }
+
+    fileprivate func xpcStepVolume(_ delta: Int, deviceUID: String, sourceRaw: String) -> Data? {
+        guard phase == .active || phase == .checking,
+              deviceUID.isEmpty || device?.uid == deviceUID else {
+            return currentEncodedState()
+        }
+        let source = VolumeState.TriggerSource(rawValue: sourceRaw) ?? .mediaKey
+        applyStep(delta, source: source)
+        return currentEncodedState()
+    }
+
+    fileprivate func xpcSetLimit(_ value: Int, deviceUID: String, isDragging: Bool) -> Data? {
+        guard deviceUID.isEmpty || device?.uid == deviceUID else {
+            return currentEncodedState()
+        }
+        setLimit(value, deferPersistence: isDragging)
+        publishState(writeDisk: !isDragging)
+        return currentEncodedState()
+    }
+
+    fileprivate func xpcToggleOutputMute(deviceUID: String, sourceRaw: String) -> Data? {
+        guard phase == .active || phase == .checking,
+              deviceUID.isEmpty || device?.uid == deviceUID else {
+            return currentEncodedState()
+        }
+        let source = VolumeState.TriggerSource(rawValue: sourceRaw) ?? .slider
+        toggleMute(source: source)
+        return currentEncodedState()
+    }
+
+    fileprivate func xpcSetEnabled(_ wantEnabled: Bool) -> Data? {
+        if wantEnabled {
+            enabled = true
+            message = nil
+            retryAfter = 0
+            unsupportedFormatDeviceUID = nil
+            consecutiveRouteFailures = 0
+            updateCurrentDeviceProfile(deferPersistence: false)
+            evaluateRoute()
+        } else {
+            enabled = false
+            message = nil
+            updateCurrentDeviceProfile(deferPersistence: false)
+            dropRoute(sync: false)
+            syncMediaKeyIntercept()
+        }
+        publishState(writeDisk: true)
+        return currentEncodedState()
+    }
+
+    /// Serialized single-writer microphone gain control inside Engine (eliminates dual-process HAL/UserDefaults race).
+    fileprivate func xpcSetMicVolume(_ value: Int, deviceUID: String, isDragging: Bool) -> (Bool, Data?) {
+        guard let mic = resolveInputDevice(expectedUID: deviceUID),
+              mic.inputVolumeControlAvailable else {
+            return (false, nil)
+        }
+        let ok = MicrophoneControl.applyVolume(
+            value,
+            for: mic,
+            persistPreMute: !isDragging,
+            clearMuteIfPositive: false
+        )
+        let status = MicrophoneControl.readStatus(for: mic)
+        return (ok, try? JSONEncoder().encode(status))
+    }
+
+    /// Serialized single-writer microphone mute control inside Engine.
+    fileprivate func xpcToggleMicMute(deviceUID: String, showHUD: Bool) -> (Bool, Data?) {
+        guard let status = toggleDefaultMicMute(expectedUID: deviceUID.isEmpty ? nil : deviceUID, showHUD: showHUD) else {
+            return (false, nil)
+        }
+        return (true, try? JSONEncoder().encode(status))
+    }
+
+    fileprivate func xpcSetPreference(_ key: String, flag: Bool) -> Data? {
+        switch key {
+        case "showOSD":
+            showOSD = flag
+            preferences.set(flag, forKey: "ShowOSD")
+            if !flag { osd.hideImmediately() }
+        case "showMenuBarPercent":
+            showMenuBarPercent = flag
+            preferences.set(flag, forKey: "ShowMenuBarPercent")
+        case "scrollOnIcon":
+            scrollOnIconEnabled = flag
+            preferences.set(flag, forKey: "ScrollOnIconEnabled")
+        default:
+            break
+        }
+        publishState(writeDisk: true)
+        return currentEncodedState()
+    }
+
+    fileprivate func xpcSetUIMediaKeysActive(_ active: Bool, clientInstanceID: String, connectionID: ObjectIdentifier) -> Data? {
+        guard !clientInstanceID.isEmpty else { return currentEncodedState() }
+        if active {
+            connectionClientMap[connectionID] = clientInstanceID
+            activeMediaKeyClients.insert(clientInstanceID)
+        } else {
+            activeMediaKeyClients.remove(clientInstanceID)
+            if connectionClientMap[connectionID] == clientInstanceID {
+                connectionClientMap.removeValue(forKey: connectionID)
+            }
+        }
+        syncMediaKeyIntercept()
+        publishState(writeDisk: false)
+        return currentEncodedState()
+    }
+
+    fileprivate func xpcRequestAccessibility() -> Data? {
+        _ = MediaKeyTap.requestAccessibilityPrompt()
+        cachedAccessibilityTrusted = MediaKeyTap.isAccessibilityTrusted
+        if cachedAccessibilityTrusted {
+            _ = mediaKeyTap.start()
+            mediaKeysActive = mediaKeyTap.isRunning
+            syncMediaKeyIntercept()
+        } else {
+            updateAccessibilityPolling()
+            if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+                NSWorkspace.shared.open(url)
+            }
+        }
+        publishState(writeDisk: true)
+        return currentEncodedState()
+    }
+
+    fileprivate func xpcReverifyCapture() -> Data? {
+        verifiedCapture = false
+        preferences.set(false, forKey: "CaptureVerified")
+        message = nil
+        retryAfter = 0
+        unsupportedFormatDeviceUID = nil
+        consecutiveRouteFailures = 0
+        dropRoute(sync: false)
+        evaluateRoute()
+        publishState(writeDisk: true)
+        return currentEncodedState()
+    }
+
+    private func resolveInputDevice(expectedUID: String?) -> AudioDeviceInfo? {
+        guard let mic = InputDeviceCatalog.currentDefault() else { return nil }
+        if let expectedUID, !expectedUID.isEmpty, mic.uid != expectedUID {
+            return nil
+        }
+        return mic
     }
 
     // MARK: - Preference Migration & Per-Device Profiles
@@ -161,6 +388,24 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
         loadProfileForCurrentDevice()
     }
 
+    /// Single atomic entry point for changing the active device and loading its volume profile.
+    private func commitDeviceChange(_ latest: AudioDeviceInfo?) {
+        let identityChanged = (latest?.uid != device?.uid || latest?.id != device?.id)
+        device = latest
+        if identityChanged {
+            loadProfileForCurrentDevice()
+            retryAfter = 0
+            message = nil
+            unsupportedFormatDeviceUID = nil
+            consecutiveRouteFailures = 0
+        }
+        if let latest {
+            installActiveDeviceListeners(for: latest.id)
+        } else {
+            removeActiveDeviceListeners()
+        }
+    }
+
     private func loadProfileForCurrentDevice() {
         guard let dev = device else {
             let fallbackLimit = min(100, max(1, preferences.object(forKey: "DefaultVolumeLimit") as? Int ?? 100))
@@ -190,10 +435,14 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func updateCurrentDeviceProfile() {
+    private func updateCurrentDeviceProfile(deferPersistence: Bool = true) {
         guard let dev = device, dev.isAutoControllable else { return }
         profiles[dev.uid] = DeviceVolumeProfile(volume: volume, volumeLimit: limit, muted: muted, enabled: enabled)
-        schedulePersistence()
+        if deferPersistence {
+            schedulePersistence()
+        } else {
+            flushPendingPersistence()
+        }
     }
 
     private func schedulePersistence() {
@@ -202,16 +451,16 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
             self?.flushPendingPersistence()
         }
         persistWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.14, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
     }
 
     private func flushPendingPersistence() {
         persistWorkItem?.cancel()
         persistWorkItem = nil
         saveProfilesNow()
-        if let state = lastPublishedState {
-            VolumeIPC.publish(state, writeDisk: true, notify: false)
-        }
+        let state = buildStateSnapshot()
+        lastPublishedState = state
+        VolumeIPC.publish(state, writeDisk: true, notify: false)
     }
 
     private func saveProfilesNow() {
@@ -224,112 +473,10 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
         preferences.set(enabled, forKey: "DefaultEnabled")
     }
 
-    // MARK: - IPC Commands
-
-    @objc private func receive(_ notification: Notification) {
-        guard let raw = notification.userInfo?["action"] as? String,
-              let command = VolumeCommand(rawValue: raw) else { return }
-        let sourceRaw = notification.userInfo?["source"] as? String
-        let source = sourceRaw.flatMap(VolumeState.TriggerSource.init(rawValue:)) ?? .slider
-
-        switch command {
-        case .enable:
-            enabled = true
-            message = nil
-            retryAfter = 0
-            updateCurrentDeviceProfile()
-            evaluateRoute()
-        case .pause:
-            enabled = false
-            message = nil
-            updateCurrentDeviceProfile()
-            dropRoute()
-            syncMediaKeyIntercept()
-        case .volume:
-            if phase == .active, let value = notification.userInfo?["value"] as? Int {
-                setAbsoluteVolume(value, source: source)
-            }
-            return
-        case .step:
-            if phase == .active, let delta = notification.userInfo?["value"] as? Int {
-                applyStep(delta, source: source)
-            }
-            return
-        case .limit:
-            if let value = notification.userInfo?["value"] as? Int {
-                setLimit(value)
-            }
-        case .mute:
-            if phase == .active {
-                toggleMute(source: source)
-            }
-            return
-        case .requestAccessibility:
-            _ = MediaKeyTap.requestAccessibilityPrompt()
-            cachedAccessibilityTrusted = MediaKeyTap.isAccessibilityTrusted
-            if cachedAccessibilityTrusted {
-                _ = mediaKeyTap.start()
-                mediaKeysActive = mediaKeyTap.isRunning
-                syncMediaKeyIntercept()
-            } else {
-                updateAccessibilityPolling()
-                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
-                    NSWorkspace.shared.open(url)
-                }
-            }
-        case .setShowOSD:
-            if let flag = notification.userInfo?["flag"] as? Bool {
-                showOSD = flag
-                preferences.set(flag, forKey: "ShowOSD")
-                if !flag { osd.hideImmediately() }
-            }
-        case .setShowMenuBarPercent:
-            if let flag = notification.userInfo?["flag"] as? Bool {
-                showMenuBarPercent = flag
-                preferences.set(flag, forKey: "ShowMenuBarPercent")
-            }
-        case .setScrollOnIcon:
-            if let flag = notification.userInfo?["flag"] as? Bool {
-                scrollOnIconEnabled = flag
-                preferences.set(flag, forKey: "ScrollOnIconEnabled")
-            }
-        case .setUIMediaKeysActive:
-            if let flag = notification.userInfo?["flag"] as? Bool {
-                uiHandlesMediaKeys = flag
-                syncMediaKeyIntercept()
-                publishState(writeDisk: true)
-                return
-            }
-        case .toggleMicMute:
-            toggleDefaultMicMute(showHUD: true)
-            return
-        case .showMicOSD:
-            if showOSD, let mic = InputDeviceCatalog.currentDefault() {
-                let status = MicrophoneControl.readStatus(for: mic)
-                osd.showMic(volume: status.volumePercent, muted: status.muted, deviceName: mic.name)
-            }
-            return
-        case .reverifyCapture:
-            verifiedCapture = false
-            preferences.set(false, forKey: "CaptureVerified")
-            message = nil
-            retryAfter = 0
-            dropRoute()
-            evaluateRoute()
-        case .shutdownEngine:
-            NSApp.terminate(nil)
-            return
-        }
-        publishState(writeDisk: false)
-    }
-
     // MARK: - Media Keys & Volume Mutations
 
     private func handleMediaKey(_ action: MediaKeyAction) {
         guard phase == .active || phase == .checking else { return }
-        if phase == .checking, !verifiedCapture {
-            // Even while verifying capture on first run, let user nudge target volume cleanly.
-        }
         switch action {
         case .volumeUp(let fine):
             applyStep(fine ? 1 : 5, source: .mediaKey)
@@ -340,7 +487,7 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func setAbsoluteVolume(_ rawValue: Int, source: VolumeState.TriggerSource) {
+    private func setAbsoluteVolume(_ rawValue: Int, source: VolumeState.TriggerSource, deferPersistence: Bool) {
         let clamped = VolumeMath.clampedVolume(rawValue, limit: limit)
         if clamped > 0 {
             volume = clamped
@@ -350,8 +497,8 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
         }
         applyGain()
         recordTrigger(source)
-        updateCurrentDeviceProfile()
-        publishState(writeDisk: false)
+        updateCurrentDeviceProfile(deferPersistence: deferPersistence)
+        publishState(writeDisk: !deferPersistence)
     }
 
     private func applyStep(_ delta: Int, source: VolumeState.TriggerSource) {
@@ -360,7 +507,7 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
         muted = next.muted
         applyGain()
         recordTrigger(source)
-        updateCurrentDeviceProfile()
+        updateCurrentDeviceProfile(deferPersistence: true)
         publishState(writeDisk: false)
     }
 
@@ -368,23 +515,25 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
         muted.toggle()
         applyGain()
         recordTrigger(source)
-        updateCurrentDeviceProfile()
-        publishState(writeDisk: false)
+        updateCurrentDeviceProfile(deferPersistence: false)
+        publishState(writeDisk: true)
     }
 
-    private func toggleDefaultMicMute(showHUD: Bool) {
-        guard let mic = InputDeviceCatalog.currentDefault(),
-              let status = MicrophoneControl.toggleMute(for: mic) else { return }
+    @discardableResult
+    private func toggleDefaultMicMute(expectedUID: String?, showHUD: Bool) -> MicrophoneControl.Status? {
+        guard let mic = resolveInputDevice(expectedUID: expectedUID),
+              let status = MicrophoneControl.toggleMute(for: mic) else { return nil }
         if showHUD && showOSD {
             osd.showMic(volume: status.volumePercent, muted: status.muted, deviceName: mic.name)
         }
+        return status
     }
 
-    private func setLimit(_ rawLimit: Int) {
+    private func setLimit(_ rawLimit: Int, deferPersistence: Bool) {
         limit = min(100, max(1, rawLimit))
         volume = min(volume, limit)
         applyGain()
-        updateCurrentDeviceProfile()
+        updateCurrentDeviceProfile(deferPersistence: deferPersistence)
     }
 
     private func applyGain() {
@@ -411,8 +560,10 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
         workspaceObservers.append(
             nc.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated {
-                    self?.sleeping = true
-                    self?.dropRoute()
+                    self?.systemSleeping = true
+                    self?.retryWorkItem?.cancel()
+                    self?.retryWorkItem = nil
+                    self?.dropRoute(sync: false)
                     self?.syncMediaKeyIntercept()
                     self?.publishState(writeDisk: true)
                 }
@@ -421,8 +572,10 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
         workspaceObservers.append(
             nc.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated {
-                    self?.sleeping = false
+                    self?.systemSleeping = false
+                    self?.screensSleeping = false
                     self?.retryAfter = 0
+                    self?.consecutiveRouteFailures = 0
                     self?.handleDeviceTopologyChange()
                 }
             }
@@ -430,9 +583,11 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
         workspaceObservers.append(
             nc.addObserver(forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated {
-                    // DisplayPort monitors can power down audio while Mac stays awake; drop cleanly so wake reconnects instantly.
+                    self?.screensSleeping = true
+                    self?.retryWorkItem?.cancel()
+                    self?.retryWorkItem = nil
                     if self?.device?.transportKind.isExternalDisplayOrDigital == true {
-                        self?.dropRoute()
+                        self?.dropRoute(sync: false)
                         self?.syncMediaKeyIntercept()
                         self?.publishState(writeDisk: false)
                     }
@@ -442,20 +597,10 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
         workspaceObservers.append(
             nc.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated {
+                    self?.screensSleeping = false
                     self?.retryAfter = 0
+                    self?.consecutiveRouteFailures = 0
                     self?.handleDeviceTopologyChange()
-                }
-            }
-        )
-        workspaceObservers.append(
-            nc.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { [weak self] note in
-                let terminatedBundle = (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleIdentifier
-                if terminatedBundle == VolumeIPC.suiteName {
-                    MainActor.assumeIsolated {
-                        self?.uiHandlesMediaKeys = false
-                        self?.syncMediaKeyIntercept()
-                        self?.publishState(writeDisk: false)
-                    }
                 }
             }
         )
@@ -485,6 +630,7 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
     private func scheduleTopologyChange() {
         topologyDebounceWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in
+            self?.topologyDebounceWorkItem = nil
             self?.handleDeviceTopologyChange()
         }
         topologyDebounceWorkItem = work
@@ -550,83 +696,136 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
         topologyDebounceWorkItem = nil
         cachedAccessibilityTrusted = MediaKeyTap.isAccessibilityTrusted
         let latest = OutputDeviceCatalog.currentDefault()
-        if latest?.uid != device?.uid || latest?.id != device?.id {
-            device = latest
-            loadProfileForCurrentDevice()
-            retryAfter = 0
-            message = nil
-        } else {
-            device = latest
-        }
-        if let latest {
-            installActiveDeviceListeners(for: latest.id)
-        } else {
-            removeActiveDeviceListeners()
-        }
-        evaluateRoute(prefetchedCurrent: latest)
+        commitDeviceChange(latest)
+        evaluateRoute()
         publishState(writeDisk: true)
     }
 
-    private func evaluateRoute(prefetchedCurrent: AudioDeviceInfo?? = nil) {
-        guard !sleeping else { return }
+    private func evaluateRoute() {
+        let current = OutputDeviceCatalog.currentDefault()
+        if current?.uid != device?.uid || current?.id != device?.id {
+            commitDeviceChange(current)
+        }
+        guard !isAsleepForCurrentDevice else { return }
+
         let now = ProcessInfo.processInfo.systemUptime
-        let current = prefetchedCurrent ?? OutputDeviceCatalog.currentDefault()
-        device = current
-        if let current { installActiveDeviceListeners(for: current.id) }
 
         if let route {
             if current == nil || current?.uid != route.device.uid || current?.id != route.device.id || !route.device.isAlive || !enabled || current?.isAutoControllable != true {
-                dropRoute()
+                dropRoute(sync: false)
             } else if route.layoutChanged {
-                dropRoute(reason: L10n.text("声音格式已变化，正在重新连接…", "Audio format changed, reconnecting…"))
-                scheduleRetry(after: 1.5)
+                dropRoute(reason: L10n.text("声音格式已变化，正在重新连接…", "Audio format changed, reconnecting…"), sync: false)
+                scheduleRetry(after: 1.0)
             }
         }
 
-        if enabled, route == nil, now >= retryAfter, let current, current.isAutoControllable, current.isAlive {
-            startRoute(for: current)
+        if enabled,
+           route == nil,
+           inFlightRouteGeneration == nil,
+           now >= retryAfter,
+           let current,
+           current.isAutoControllable,
+           current.isAlive,
+           unsupportedFormatDeviceUID != current.uid {
+            startRouteAsync(for: current)
         }
         syncMediaKeyIntercept()
     }
 
-    private func startRoute(for target: AudioDeviceInfo) {
-        let candidate = AudioRoute(device: target)
-        candidate.onStreamFormatChanged = { [weak self] in
-            guard let self else { return }
-            self.dropRoute(reason: L10n.text("采样率已切换，正在平滑重连…", "Sample rate changed, reconnecting…"))
-            self.scheduleRetry(after: 0.4)
-        }
-
+    /// Runs `AudioRoute.start` on `routeQueue` with generation validation so `AudioDeviceStart` never stalls MainActor.
+    private func startRouteAsync(for target: AudioDeviceInfo) {
+        routeGeneration &+= 1
+        let gen = routeGeneration
+        inFlightRouteGeneration = gen
         let initialFraction = Double(muted ? 0 : min(volume, limit)) / 100.0
-        do {
-            // Once capture permission is verified, engage attenuation synchronously so first sample never blasts 100%.
-            try candidate.start(immediateVolume: verifiedCapture ? initialFraction : nil)
-            route = candidate
-            message = nil
+        let useImmediate = verifiedCapture
+        let candidate = AudioRoute(device: target)
 
-            if verifiedCapture {
-                activateState(for: candidate)
-            } else {
-                phase = .checking
-                runningWithZeroSignalSince = nil
-                startCheckingTimer()
+        routeQueue.async { [weak self] in
+            let result: Result<AudioRoute, Error>
+            do {
+                try candidate.start(immediateVolume: useImmediate ? initialFraction : nil)
+                result = .success(candidate)
+            } catch {
+                candidate.stop()
+                result = .failure(error)
             }
-        } catch {
-            dropRoute(reason: error.localizedDescription)
-            scheduleRetry(after: 4.0)
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self else {
+                    candidate.stop()
+                    return
+                }
+                if self.inFlightRouteGeneration == gen {
+                    self.inFlightRouteGeneration = nil
+                }
+                guard gen == self.routeGeneration,
+                      !self.isAsleepForCurrentDevice,
+                      self.enabled,
+                      self.device?.uid == target.uid else {
+                    // Route superseded while starting — tear down off MainActor and re-evaluate only if no newer start is active.
+                    self.routeQueue.async { candidate.stop() }
+                    if self.inFlightRouteGeneration == nil {
+                        self.evaluateRoute()
+                    }
+                    return
+                }
+
+                switch result {
+                case .success(let activeRoute):
+                    activeRoute.onStreamFormatChanged = { [weak self] in
+                        Task { @MainActor in
+                            guard let self, self.route === activeRoute else { return }
+                            self.dropRoute(reason: L10n.text("采样率已切换，正在重新连接…", "Sample rate changed, reconnecting…"), sync: false)
+                            self.scheduleRetry(after: 0.4)
+                            self.publishState(writeDisk: false)
+                        }
+                    }
+                    self.route = activeRoute
+                    self.message = nil
+                    self.consecutiveRouteFailures = 0
+                    self.unsupportedFormatDeviceUID = nil
+                    self.applyGain()
+
+                    if useImmediate {
+                        self.activateState(for: activeRoute)
+                    } else {
+                        self.phase = .checking
+                        self.runningWithZeroSignalSince = nil
+                        self.startCheckingTimer()
+                    }
+                    self.syncMediaKeyIntercept()
+                    self.publishState(writeDisk: true)
+
+                case .failure(let error):
+                    if let audioErr = error as? AudioFailure, audioErr.status == kAudioDeviceUnsupportedFormatError {
+                        self.unsupportedFormatDeviceUID = target.uid
+                        self.dropRoute(
+                            reason: L10n.text("当前音频流格式暂不支持软件控音，切换格式或设备后将自动重试。", "Current audio stream format is unsupported; will retry on format or device change."),
+                            sync: false
+                        )
+                    } else {
+                        self.consecutiveRouteFailures += 1
+                        let backoff = min(30.0, 2.0 * pow(2.0, Double(min(4, self.consecutiveRouteFailures - 1))))
+                        self.dropRoute(reason: error.localizedDescription, sync: false)
+                        self.scheduleRetry(after: backoff)
+                    }
+                    self.publishState(writeDisk: true)
+                }
+            }
         }
-        syncMediaKeyIntercept()
     }
 
     private func activateState(for activeRoute: AudioRoute) {
         callbackCount = activeRoute.callbackCount
+        renderedCallbackCount = activeRoute.renderedCallbackCount
         lastCallbackTime = ProcessInfo.processInfo.systemUptime
         phase = .active
         runningWithZeroSignalSince = nil
         checkingTimer?.invalidate()
         checkingTimer = nil
-        shortcuts = hotkeys.register()
-        if MediaKeyTap.isAccessibilityTrusted && !mediaKeyTap.isRunning {
+        outputHotkeysAvailable = hotkeys.register()
+        if cachedAccessibilityTrusted && !mediaKeyTap.isRunning {
             _ = mediaKeyTap.start()
         }
         mediaKeysActive = mediaKeyTap.isRunning
@@ -637,6 +836,12 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
     private func evaluateCheckingSignal() {
         guard phase == .checking, let route else { return }
         let now = ProcessInfo.processInfo.systemUptime
+        if route.layoutChanged {
+            dropRoute(reason: L10n.text("声音格式已变化，正在重新连接…", "Audio format changed, reconnecting…"), sync: false)
+            scheduleRetry(after: 1.0)
+            publishState(writeDisk: false)
+            return
+        }
         if route.hasSignal {
             do {
                 try route.activate(volume: Double(muted ? 0 : min(volume, limit)) / 100.0)
@@ -645,51 +850,56 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
                 activateState(for: route)
                 publishState(writeDisk: true)
             } catch {
-                dropRoute(reason: error.localizedDescription)
+                dropRoute(reason: error.localizedDescription, sync: false)
                 scheduleRetry(after: 4.0)
                 publishState(writeDisk: true)
             }
             return
         }
 
-        // Only count permission timeout while an app is actively sending audio to the device.
+        // Keep retryable (never permanently set enabled = false on silent playback tracks).
         if route.device.isRunningSomewhere {
             if runningWithZeroSignalSince == nil {
                 runningWithZeroSignalSince = now
             } else if let since = runningWithZeroSignalSince, now - since > 8.0 {
-                dropRoute(reason: L10n.text("未能读取系统音频，请在「隐私与安全性 → 录屏与系统录音」中允许桌面音量后台。", "System audio capture unavailable. Allow DisplayVolume Engine in Privacy & Security."))
-                enabled = false
-                updateCurrentDeviceProfile()
-                publishState(writeDisk: true)
+                message = L10n.text(
+                    "尚未检测到有效音频信号。若持续无反应，请检查「隐私与安全性 → 录屏与系统录音」权限并播放非静音音频。",
+                    "No audio signal detected yet. Check System Audio Recording permission and play non-silent audio."
+                )
+                publishState(writeDisk: false)
             }
         } else {
             runningWithZeroSignalSince = nil
         }
     }
 
-    private func dropRoute(reason: String? = nil) {
+    private func dropRoute(reason: String? = nil, sync: Bool) {
+        routeGeneration &+= 1
+        inFlightRouteGeneration = nil
         stopTimers()
-        route?.stop()
+        let oldRoute = route
         route = nil
         phase = .idle
         runningWithZeroSignalSince = nil
         message = reason
-        shortcuts = false
+        outputHotkeysAvailable = false
         hotkeys.unregisterOutput()
         syncMediaKeyIntercept()
+
+        if let oldRoute {
+            if sync {
+                routeQueue.sync { oldRoute.stop() }
+            } else {
+                routeQueue.async { oldRoute.stop() }
+            }
+        }
     }
 
     private func syncMediaKeyIntercept() {
-        // Yield backup Engine tap whenever the main UI app is running its own active MediaKeyTap.
         if uiHandlesMediaKeys {
-            let uiStillAlive = !NSRunningApplication.runningApplications(withBundleIdentifier: VolumeIPC.suiteName).isEmpty
-            if uiStillAlive {
-                mediaKeyTap.shouldIntercept = false
-                mediaKeysActive = true
-                return
-            } else {
-                uiHandlesMediaKeys = false
-            }
+            mediaKeyTap.shouldIntercept = false
+            mediaKeysActive = true
+            return
         }
         let trusted = cachedAccessibilityTrusted || MediaKeyTap.isAccessibilityTrusted
         cachedAccessibilityTrusted = trusted
@@ -752,21 +962,30 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
     }
 
     @objc private func onWatchdogTick() {
-        guard !sleeping, phase == .active, let route else { return }
+        guard !isAsleepForCurrentDevice, phase == .active, let route else { return }
         if !route.device.isAlive {
             handleDeviceTopologyChange()
             return
         }
+        if route.layoutChanged {
+            dropRoute(reason: L10n.text("音频通道格式变化，正在重新连接…", "Audio layout changed, reconnecting…"), sync: false)
+            scheduleRetry(after: 1.0)
+            publishState(writeDisk: false)
+            return
+        }
+
         let now = ProcessInfo.processInfo.systemUptime
-        let latest = route.callbackCount
-        if latest != callbackCount {
-            callbackCount = latest
+        let latestCB = route.callbackCount
+        let latestRendered = route.renderedCallbackCount
+        if latestRendered != renderedCallbackCount {
+            callbackCount = latestCB
+            renderedCallbackCount = latestRendered
             lastCallbackTime = now
         } else if !route.device.isRunningSomewhere {
-            // CoreAudio may pause hardware callbacks during idle silence; avoid spurious reconnect loops.
+            callbackCount = latestCB
             lastCallbackTime = now
         } else if now - lastCallbackTime > 3.5 {
-            dropRoute(reason: L10n.text("音频通道暂时中断，正在重新连接…", "Audio stream interrupted, reconnecting…"))
+            dropRoute(reason: L10n.text("音频通道暂时中断，正在重新连接…", "Audio stream interrupted, reconnecting…"), sync: false)
             scheduleRetry(after: 1.5)
             publishState(writeDisk: false)
         }
@@ -782,9 +1001,14 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
         publishState(writeDisk: true)
     }
 
-    private func publishState(writeDisk: Bool) {
+    private func buildStateSnapshot() -> VolumeState {
         let trusted = cachedAccessibilityTrusted
-        let state = VolumeState(
+        return VolumeState(
+            protocolVersion: VolumeState.currentProtocolVersion,
+            engineBuild: engineBuild,
+            engineInstanceID: engineInstanceID,
+            stateSequence: stateSequence,
+            routeGeneration: routeGeneration,
             enginePID: getpid(),
             phase: phase,
             deviceUID: device?.uid,
@@ -798,8 +1022,9 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
             enabled: enabled,
             verifiedCapture: verifiedCapture,
             mediaKeysAuthorized: uiHandlesMediaKeys || trusted,
-            mediaKeysActive: (uiHandlesMediaKeys || (trusted && mediaKeyTap.isRunning)),
-            shortcutsAvailable: shortcuts,
+            mediaKeysActive: uiHandlesMediaKeys || (trusted && mediaKeyTap.isRunning),
+            shortcutsAvailable: outputHotkeysAvailable,
+            micHotkeyAvailable: micHotkeyAvailable,
             showOSD: showOSD,
             showMenuBarPercent: showMenuBarPercent,
             scrollOnIconEnabled: scrollOnIconEnabled,
@@ -807,9 +1032,118 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
             lastTriggerNonce: lastTriggerNonce,
             message: message
         )
-        if state != lastPublishedState {
-            lastPublishedState = state
-            VolumeIPC.publish(state, writeDisk: writeDisk, notify: true)
+    }
+
+    private func publishState(writeDisk: Bool) {
+        var candidate = buildStateSnapshot()
+        if let prev = lastPublishedState {
+            var prevComparable = prev
+            prevComparable.stateSequence = candidate.stateSequence
+            if prevComparable == candidate {
+                if writeDisk {
+                    VolumeIPC.publish(prev, writeDisk: true, notify: false)
+                }
+                return
+            }
+        }
+        stateSequence &+= 1
+        candidate.stateSequence = stateSequence
+        lastPublishedState = candidate
+        VolumeIPC.publish(candidate, writeDisk: writeDisk, notify: true)
+    }
+}
+
+/// Bridges ObjC XPC invocations cleanly onto `@MainActor` VolumeEngine.
+private final class EngineXPCProxy: NSObject, DisplayVolumeEngineXPCProtocol {
+    private weak var engine: VolumeEngine?
+    private let connectionID: ObjectIdentifier
+
+    init(engine: VolumeEngine, connection: NSXPCConnection) {
+        self.engine = engine
+        self.connectionID = ObjectIdentifier(connection)
+    }
+
+    func ping(withReply reply: @escaping (Int, Int, String) -> Void) {
+        Task { @MainActor in
+            guard let engine = self.engine else { reply(0, 0, ""); return }
+            let info = engine.xpcPing()
+            reply(info.0, info.1, info.2)
+        }
+    }
+
+    func fetchState(withReply reply: @escaping (Data?) -> Void) {
+        Task { @MainActor in
+            reply(self.engine?.currentEncodedState())
+        }
+    }
+
+    func setVolume(_ value: Int, deviceUID: String, isDragging: Bool, source: String, withReply reply: @escaping (Data?) -> Void) {
+        Task { @MainActor in
+            reply(self.engine?.xpcSetVolume(value, deviceUID: deviceUID, isDragging: isDragging, sourceRaw: source))
+        }
+    }
+
+    func stepVolume(_ delta: Int, deviceUID: String, source: String, withReply reply: @escaping (Data?) -> Void) {
+        Task { @MainActor in
+            reply(self.engine?.xpcStepVolume(delta, deviceUID: deviceUID, sourceRaw: source))
+        }
+    }
+
+    func setLimit(_ limit: Int, deviceUID: String, isDragging: Bool, withReply reply: @escaping (Data?) -> Void) {
+        Task { @MainActor in
+            reply(self.engine?.xpcSetLimit(limit, deviceUID: deviceUID, isDragging: isDragging))
+        }
+    }
+
+    func toggleOutputMute(deviceUID: String, source: String, withReply reply: @escaping (Data?) -> Void) {
+        Task { @MainActor in
+            reply(self.engine?.xpcToggleOutputMute(deviceUID: deviceUID, sourceRaw: source))
+        }
+    }
+
+    func setEnabled(_ enabled: Bool, withReply reply: @escaping (Data?) -> Void) {
+        Task { @MainActor in
+            reply(self.engine?.xpcSetEnabled(enabled))
+        }
+    }
+
+    func setMicVolume(_ value: Int, deviceUID: String, isDragging: Bool, withReply reply: @escaping (Bool, Data?) -> Void) {
+        Task { @MainActor in
+            guard let engine = self.engine else { reply(false, nil); return }
+            let res = engine.xpcSetMicVolume(value, deviceUID: deviceUID, isDragging: isDragging)
+            reply(res.0, res.1)
+        }
+    }
+
+    func toggleMicMute(deviceUID: String, showOSD: Bool, withReply reply: @escaping (Bool, Data?) -> Void) {
+        Task { @MainActor in
+            guard let engine = self.engine else { reply(false, nil); return }
+            let res = engine.xpcToggleMicMute(deviceUID: deviceUID, showHUD: showOSD)
+            reply(res.0, res.1)
+        }
+    }
+
+    func setPreference(_ key: String, flag: Bool, withReply reply: @escaping (Data?) -> Void) {
+        Task { @MainActor in
+            reply(self.engine?.xpcSetPreference(key, flag: flag))
+        }
+    }
+
+    func setUIMediaKeysActive(_ active: Bool, clientInstanceID: String, withReply reply: @escaping (Data?) -> Void) {
+        Task { @MainActor in
+            reply(self.engine?.xpcSetUIMediaKeysActive(active, clientInstanceID: clientInstanceID, connectionID: self.connectionID))
+        }
+    }
+
+    func requestAccessibility(withReply reply: @escaping (Data?) -> Void) {
+        Task { @MainActor in
+            reply(self.engine?.xpcRequestAccessibility())
+        }
+    }
+
+    func reverifyCapture(withReply reply: @escaping (Data?) -> Void) {
+        Task { @MainActor in
+            reply(self.engine?.xpcReverifyCapture())
         }
     }
 }

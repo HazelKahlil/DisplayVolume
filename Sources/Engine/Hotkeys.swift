@@ -10,6 +10,9 @@ final class Hotkeys {
     private let action: (UInt32) -> Void
     private static let signature: UInt32 = 0x44564F4C // 'DVOL'
 
+    private(set) var outputHotkeysRegistered = false
+    private(set) var micHotkeyRegistered = false
+
     init(action: @escaping (UInt32) -> Void) {
         self.action = action
     }
@@ -43,7 +46,7 @@ final class Hotkeys {
                 let repeatPress = event.isARepeat
                 let handled = MainActor.assumeIsolated {
                     guard let self else { return false }
-                    if flags == [.control, .option] {
+                    if self.outputHotkeysRegistered, flags == [.control, .option] {
                         switch code {
                         case kVK_UpArrow: self.action(1)
                         case kVK_DownArrow: self.action(2)
@@ -52,7 +55,7 @@ final class Hotkeys {
                         }
                         return true
                     }
-                    if flags == [.control, .option, .shift], code == kVK_ANSI_M {
+                    if self.micHotkeyRegistered, flags == [.control, .option, .shift], code == kVK_ANSI_M {
                         if !repeatPress { self.action(4) }
                         return true
                     }
@@ -67,8 +70,14 @@ final class Hotkeys {
     /// Registers global `⌃⌥⇧ M` microphone mute toggle (remains active regardless of output device).
     @discardableResult
     func registerMicMute() -> Bool {
-        guard ensureHandlerInstalled() else { return false }
-        if micKey != nil { return true }
+        guard ensureHandlerInstalled() else {
+            micHotkeyRegistered = false
+            return false
+        }
+        if micKey != nil {
+            micHotkeyRegistered = true
+            return true
+        }
         var key: EventHotKeyRef?
         let status = RegisterEventHotKey(
             UInt32(kVK_ANSI_M),
@@ -78,8 +87,12 @@ final class Hotkeys {
             0,
             &key
         )
-        guard status == noErr, let key else { return false }
+        guard status == noErr, let key else {
+            micHotkeyRegistered = false
+            return false
+        }
         micKey = key
+        micHotkeyRegistered = true
         return true
     }
 
@@ -104,18 +117,21 @@ final class Hotkeys {
             }
             outputKeys.append(key)
         }
+        outputHotkeysRegistered = true
         return true
     }
 
     func unregisterOutput() {
         for key in outputKeys { UnregisterEventHotKey(key) }
         outputKeys.removeAll()
+        outputHotkeysRegistered = false
     }
 
     func unregisterAll() {
         unregisterOutput()
         if let micKey { UnregisterEventHotKey(micKey) }
         micKey = nil
+        micHotkeyRegistered = false
         if let localMonitor { NSEvent.removeMonitor(localMonitor) }
         localMonitor = nil
         if let handler { RemoveEventHandler(handler) }
