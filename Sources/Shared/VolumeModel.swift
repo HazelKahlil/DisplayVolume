@@ -186,3 +186,10 @@ enum InputMuteMath {
         }
     }
 }
+
+/// Pure throttling & diff-guard math shared across UI drag controls and HAL writers.
+enum DispatchThrottleMath {
+    static func shouldEmit(now: TimeInterval, lastSentAt: TimeInterval, minInterval: TimeInterval, isDragging: Bool) -> Bool {
+        !isDragging || (now - lastSentAt) >= minInterval
+    }
+}

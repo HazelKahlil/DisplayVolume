@@ -186,7 +186,7 @@ struct AudioDeviceInfo: Equatable, Hashable, Identifiable {
 /// Uses HAL property calls only — never opens an audio capture stream (no mic privacy dot, no AirPods HFP downgrade).
 enum AudioHardwareControl {
     private static func candidateElements(channelCount: Int) -> [UInt32] {
-        let maxCh = UInt32(min(8, max(2, channelCount)))
+        let maxCh = UInt32(min(8, max(1, channelCount)))
         return [0] + Array(1...maxCh)
     }
 
@@ -217,7 +217,7 @@ enum AudioHardwareControl {
             }
         }
 
-        let maxCh = UInt32(min(8, max(2, channelCount)))
+        let maxCh = UInt32(min(8, max(1, channelCount)))
         var values: [Float] = []
         for ch in 1...maxCh {
             var prop = audioAddress(kAudioDevicePropertyVolumeScalar, scope: scope, element: ch)
@@ -245,7 +245,7 @@ enum AudioHardwareControl {
             }
         }
 
-        let maxCh = UInt32(min(8, max(2, channelCount)))
+        let maxCh = UInt32(min(8, max(1, channelCount)))
         var wroteAny = false
         for ch in 1...maxCh {
             var prop = audioAddress(kAudioDevicePropertyVolumeScalar, scope: scope, element: ch)
@@ -286,7 +286,7 @@ enum AudioHardwareControl {
             }
         }
 
-        let maxCh = UInt32(min(8, max(2, channelCount)))
+        let maxCh = UInt32(min(8, max(1, channelCount)))
         var wroteAny = false
         for ch in 1...maxCh {
             var prop = audioAddress(kAudioDevicePropertyMute, scope: scope, element: ch)
@@ -302,13 +302,53 @@ enum AudioHardwareControl {
     }
 }
 
-enum OutputDeviceCatalog {
-    static func currentDefault() -> AudioDeviceInfo? {
-        var property = audioAddress(kAudioHardwarePropertyDefaultOutputDevice)
+/// Single-pass CoreAudio device snapshot to eliminate redundant multi-scan HAL stalls on popover open & topology bursts.
+struct AudioDeviceSnapshot: Equatable {
+    let outputDevices: [AudioDeviceInfo]
+    let inputDevices: [AudioDeviceInfo]
+    let defaultOutput: AudioDeviceInfo?
+    let defaultInput: AudioDeviceInfo?
+}
+
+enum AudioDeviceCatalog {
+    static func captureSnapshot() -> AudioDeviceSnapshot {
+        let all = OutputDeviceCatalog.allDevices()
+        let byID = Dictionary(uniqueKeysWithValues: all.map { ($0.id, $0) })
+
+        let outputs = OutputDeviceCatalog.sortOutputs(all.filter { $0.outputChannels > 0 && !$0.isHidden })
+        let inputs = InputDeviceCatalog.sortInputs(all.filter { $0.inputChannels > 0 && !$0.isHidden })
+
+        let defaultOutID = readDefaultDeviceID(kAudioHardwarePropertyDefaultOutputDevice)
+        let defaultInID = readDefaultDeviceID(kAudioHardwarePropertyDefaultInputDevice)
+
+        let defaultOut = (defaultOutID.flatMap { byID[$0] } ?? defaultOutID.flatMap { OutputDeviceCatalog.inspect(deviceID: $0) })
+            .flatMap { $0.outputChannels > 0 ? $0 : nil }
+        let defaultIn = (defaultInID.flatMap { byID[$0] } ?? defaultInID.flatMap { OutputDeviceCatalog.inspect(deviceID: $0) })
+            .flatMap { $0.inputChannels > 0 ? $0 : nil }
+
+        return AudioDeviceSnapshot(
+            outputDevices: outputs,
+            inputDevices: inputs,
+            defaultOutput: defaultOut,
+            defaultInput: defaultIn
+        )
+    }
+
+    static func readDefaultDeviceID(_ selector: AudioObjectPropertySelector) -> AudioDeviceID? {
+        var property = audioAddress(selector)
         var id = AudioDeviceID(kAudioObjectUnknown)
         var size = UInt32(MemoryLayout.size(ofValue: id))
         guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &property, 0, nil, &size, &id) == noErr,
-              id != kAudioObjectUnknown,
+              id != kAudioObjectUnknown else {
+            return nil
+        }
+        return id
+    }
+}
+
+enum OutputDeviceCatalog {
+    static func currentDefault() -> AudioDeviceInfo? {
+        guard let id = AudioDeviceCatalog.readDefaultDeviceID(kAudioHardwarePropertyDefaultOutputDevice),
               let info = inspect(deviceID: id),
               info.outputChannels > 0 else {
             return nil
@@ -316,26 +356,34 @@ enum OutputDeviceCatalog {
         return info
     }
 
+    static func sortOutputs(_ devices: [AudioDeviceInfo]) -> [AudioDeviceInfo] {
+        devices.sorted { lhs, rhs in
+            if lhs.isPhysicalOutput != rhs.isPhysicalOutput { return lhs.isPhysicalOutput }
+            if lhs.isAutoControllable != rhs.isAutoControllable { return lhs.isAutoControllable }
+            return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+        }
+    }
+
     static func allOutputDevices() -> [AudioDeviceInfo] {
-        allDevices()
-            .filter { $0.outputChannels > 0 && !$0.isHidden }
-            .sorted { lhs, rhs in
-                if lhs.isPhysicalOutput != rhs.isPhysicalOutput { return lhs.isPhysicalOutput }
-                if lhs.isAutoControllable != rhs.isAutoControllable { return lhs.isAutoControllable }
-                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
-            }
+        sortOutputs(allDevices().filter { $0.outputChannels > 0 && !$0.isHidden })
     }
 
     @discardableResult
-    static func setDefaultOutput(uid: String) -> Bool {
-        guard let target = allOutputDevices().first(where: { $0.uid == uid }) else { return false }
-        var id = target.id
+    static func setDefaultOutput(deviceID: AudioDeviceID) -> Bool {
+        guard deviceID != kAudioObjectUnknown else { return false }
+        var id = deviceID
         let size = UInt32(MemoryLayout.size(ofValue: id))
         var outAddr = audioAddress(kAudioHardwarePropertyDefaultOutputDevice)
         let outStatus = AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &outAddr, 0, nil, size, &id)
         var sysAddr = audioAddress(kAudioHardwarePropertyDefaultSystemOutputDevice)
         _ = AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &sysAddr, 0, nil, size, &id)
         return outStatus == noErr
+    }
+
+    @discardableResult
+    static func setDefaultOutput(uid: String) -> Bool {
+        guard let target = allOutputDevices().first(where: { $0.uid == uid }) else { return false }
+        return setDefaultOutput(deviceID: target.id)
     }
 
     static func allDevices() -> [AudioDeviceInfo] {
@@ -430,11 +478,7 @@ enum OutputDeviceCatalog {
 
 enum InputDeviceCatalog {
     static func currentDefault() -> AudioDeviceInfo? {
-        var property = audioAddress(kAudioHardwarePropertyDefaultInputDevice)
-        var id = AudioDeviceID(kAudioObjectUnknown)
-        var size = UInt32(MemoryLayout.size(ofValue: id))
-        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &property, 0, nil, &size, &id) == noErr,
-              id != kAudioObjectUnknown,
+        guard let id = AudioDeviceCatalog.readDefaultDeviceID(kAudioHardwarePropertyDefaultInputDevice),
               let info = OutputDeviceCatalog.inspect(deviceID: id),
               info.inputChannels > 0 else {
             return nil
@@ -442,27 +486,35 @@ enum InputDeviceCatalog {
         return info
     }
 
+    static func sortInputs(_ devices: [AudioDeviceInfo]) -> [AudioDeviceInfo] {
+        devices.sorted { lhs, rhs in
+            if lhs.isPhysicalInput != rhs.isPhysicalInput { return lhs.isPhysicalInput }
+            let lhsExternal = lhs.transportKind == .usb || lhs.transportKind == .bluetooth
+            let rhsExternal = rhs.transportKind == .usb || rhs.transportKind == .bluetooth
+            if lhsExternal != rhsExternal { return lhsExternal }
+            if lhs.transportKind == .builtIn && rhs.transportKind != .builtIn { return true }
+            if rhs.transportKind == .builtIn && lhs.transportKind != .builtIn { return false }
+            return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+        }
+    }
+
     static func allInputDevices() -> [AudioDeviceInfo] {
-        OutputDeviceCatalog.allDevices()
-            .filter { $0.inputChannels > 0 && !$0.isHidden }
-            .sorted { lhs, rhs in
-                if lhs.isPhysicalInput != rhs.isPhysicalInput { return lhs.isPhysicalInput }
-                let lhsExternal = lhs.transportKind == .usb || lhs.transportKind == .bluetooth
-                let rhsExternal = rhs.transportKind == .usb || rhs.transportKind == .bluetooth
-                if lhsExternal != rhsExternal { return lhsExternal }
-                if lhs.transportKind == .builtIn && rhs.transportKind != .builtIn { return true }
-                if rhs.transportKind == .builtIn && lhs.transportKind != .builtIn { return false }
-                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
-            }
+        sortInputs(OutputDeviceCatalog.allDevices().filter { $0.inputChannels > 0 && !$0.isHidden })
+    }
+
+    @discardableResult
+    static func setDefaultInput(deviceID: AudioDeviceID) -> Bool {
+        guard deviceID != kAudioObjectUnknown else { return false }
+        var id = deviceID
+        let size = UInt32(MemoryLayout.size(ofValue: id))
+        var inAddr = audioAddress(kAudioHardwarePropertyDefaultInputDevice)
+        return AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &inAddr, 0, nil, size, &id) == noErr
     }
 
     @discardableResult
     static func setDefaultInput(uid: String) -> Bool {
         guard let target = allInputDevices().first(where: { $0.uid == uid }) else { return false }
-        var id = target.id
-        let size = UInt32(MemoryLayout.size(ofValue: id))
-        var inAddr = audioAddress(kAudioHardwarePropertyDefaultInputDevice)
-        return AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &inAddr, 0, nil, size, &id) == noErr
+        return setDefaultInput(deviceID: target.id)
     }
 }
 
@@ -522,28 +574,35 @@ enum MicrophoneControl {
         )
     }
 
-    @discardableResult
-    static func setVolume(_ percent: Int, for device: AudioDeviceInfo) -> Status {
+    /// Writes microphone gain to CoreAudio HAL.
+    /// Pass `persistPreMute: false` during continuous slider drags so UserDefaults plist writes never stall the main thread.
+    static func applyVolume(_ percent: Int, for device: AudioDeviceInfo, persistPreMute: Bool = true) {
         let clamped = min(100, max(0, percent))
-        if device.inputVolumeControlAvailable {
-            _ = AudioHardwareControl.writeScalarVolume(
-                deviceID: device.id,
-                scope: kAudioDevicePropertyScopeInput,
-                channelCount: device.inputChannels,
-                fraction: Float(clamped) / 100.0
-            )
-            if clamped > 0 {
+        guard device.inputVolumeControlAvailable else { return }
+        _ = AudioHardwareControl.writeScalarVolume(
+            deviceID: device.id,
+            scope: kAudioDevicePropertyScopeInput,
+            channelCount: device.inputChannels,
+            fraction: Float(clamped) / 100.0
+        )
+        if clamped > 0 {
+            if persistPreMute {
                 savePreMuteVolume(clamped, uid: device.uid)
-                if device.inputMuteControlAvailable {
-                    _ = AudioHardwareControl.writeMute(
-                        deviceID: device.id,
-                        scope: kAudioDevicePropertyScopeInput,
-                        channelCount: device.inputChannels,
-                        muted: false
-                    )
-                }
+            }
+            if device.inputMuteControlAvailable {
+                _ = AudioHardwareControl.writeMute(
+                    deviceID: device.id,
+                    scope: kAudioDevicePropertyScopeInput,
+                    channelCount: device.inputChannels,
+                    muted: false
+                )
             }
         }
+    }
+
+    @discardableResult
+    static func setVolume(_ percent: Int, for device: AudioDeviceInfo) -> Status {
+        applyVolume(percent, for: device, persistPreMute: true)
         return readStatus(for: device)
     }
 

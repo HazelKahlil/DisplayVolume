@@ -14,6 +14,7 @@ private final class ClickableNativeSlider: NSSlider {
 
         let local = convert(event.locationInWindow, from: nil)
         let knobRect = sliderCell.knobRect(flipped: isFlipped)
+        var emittedInitialTrack = false
         if !knobRect.contains(local) {
             let track = sliderCell.barRect(flipped: isFlipped)
             let usableWidth = max(1, track.width - knobRect.width)
@@ -22,9 +23,12 @@ private final class ClickableNativeSlider: NSSlider {
             let newValue = minValue + (maxValue - minValue) * Double(max(0, min(1, fraction)))
             doubleValue = newValue
             onTrackChange?(Int(newValue.rounded()), true)
+            emittedInitialTrack = true
         }
 
-        onTrackChange?(Int(doubleValue.rounded()), true)
+        if !emittedInitialTrack {
+            onTrackChange?(Int(doubleValue.rounded()), true)
+        }
         super.mouseDown(with: event)
         onTrackChange?(Int(doubleValue.rounded()), false)
     }
@@ -66,9 +70,13 @@ struct SmoothNativeSlider: NSViewRepresentable {
         nsView.setAccessibilityLabel(accessibilityTitle)
         if !context.coordinator.isTracking {
             let clamped = Double(min(maxValue, max(minValue, value)))
-            if Int(nsView.doubleValue.rounded()) != Int(clamped.rounded()) {
+            let rounded = Int(clamped.rounded())
+            if Int(nsView.doubleValue.rounded()) != rounded {
                 nsView.doubleValue = clamped
             }
+            // Keep Coordinator in sync with external changes (F10–F12 keys, presets, HAL listeners)
+            // so dragging back to a previously visited value is never dropped as a duplicate.
+            context.coordinator.syncExternalValue(rounded)
         }
     }
 
@@ -80,6 +88,10 @@ struct SmoothNativeSlider: NSViewRepresentable {
 
         init(onChange: @escaping (Int, Bool) -> Void) {
             self.onChange = onChange
+        }
+
+        func syncExternalValue(_ value: Int) {
+            lastSentValue = value
         }
 
         func handleTrack(value: Int, isTracking: Bool) {

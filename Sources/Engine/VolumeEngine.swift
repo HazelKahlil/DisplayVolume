@@ -21,6 +21,7 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
     private var scrollOnIconEnabled: Bool = true
 
     private var shortcuts = false
+    private var cachedAccessibilityTrusted = MediaKeyTap.isAccessibilityTrusted
     private var mediaKeysActive = false
     private var uiHandlesMediaKeys = false
     private var message: String?
@@ -31,6 +32,8 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
     private var watchdogTimer: Timer?
     private var accessibilityPollTimer: Timer?
     private var persistWorkItem: DispatchWorkItem?
+    private var topologyDebounceWorkItem: DispatchWorkItem?
+    private var retryWorkItem: DispatchWorkItem?
 
     private var systemListenersInstalled = false
     private var observedDeviceID: AudioDeviceID = kAudioObjectUnknown
@@ -98,6 +101,10 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         flushPendingPersistence()
+        topologyDebounceWorkItem?.cancel()
+        topologyDebounceWorkItem = nil
+        retryWorkItem?.cancel()
+        retryWorkItem = nil
         stopTimers()
         accessibilityPollTimer?.invalidate()
         accessibilityPollTimer = nil
@@ -242,10 +249,12 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
             if phase == .active, let value = notification.userInfo?["value"] as? Int {
                 setAbsoluteVolume(value, source: source)
             }
+            return
         case .step:
             if phase == .active, let delta = notification.userInfo?["value"] as? Int {
                 applyStep(delta, source: source)
             }
+            return
         case .limit:
             if let value = notification.userInfo?["value"] as? Int {
                 setLimit(value)
@@ -254,9 +263,11 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
             if phase == .active {
                 toggleMute(source: source)
             }
+            return
         case .requestAccessibility:
             _ = MediaKeyTap.requestAccessibilityPrompt()
-            if MediaKeyTap.isAccessibilityTrusted {
+            cachedAccessibilityTrusted = MediaKeyTap.isAccessibilityTrusted
+            if cachedAccessibilityTrusted {
                 _ = mediaKeyTap.start()
                 mediaKeysActive = mediaKeyTap.isRunning
                 syncMediaKeyIntercept()
@@ -464,11 +475,20 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
 
         var devicesAddr = audioAddress(kAudioHardwarePropertyDevices)
         let devicesBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            Task { @MainActor in self?.handleDeviceTopologyChange() }
+            Task { @MainActor in self?.scheduleTopologyChange() }
         }
         if AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &devicesAddr, DispatchQueue.main, devicesBlock) == noErr {
             devicesListListener = devicesBlock
         }
+    }
+
+    private func scheduleTopologyChange() {
+        topologyDebounceWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.handleDeviceTopologyChange()
+        }
+        topologyDebounceWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06, execute: work)
     }
 
     private func removeSystemAudioListeners() {
@@ -526,6 +546,9 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
     }
 
     private func handleDeviceTopologyChange() {
+        topologyDebounceWorkItem?.cancel()
+        topologyDebounceWorkItem = nil
+        cachedAccessibilityTrusted = MediaKeyTap.isAccessibilityTrusted
         let latest = OutputDeviceCatalog.currentDefault()
         if latest?.uid != device?.uid || latest?.id != device?.id {
             device = latest
@@ -540,14 +563,14 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
         } else {
             removeActiveDeviceListeners()
         }
-        evaluateRoute()
+        evaluateRoute(prefetchedCurrent: latest)
         publishState(writeDisk: true)
     }
 
-    private func evaluateRoute() {
+    private func evaluateRoute(prefetchedCurrent: AudioDeviceInfo?? = nil) {
         guard !sleeping else { return }
         let now = ProcessInfo.processInfo.systemUptime
-        let current = OutputDeviceCatalog.currentDefault()
+        let current = prefetchedCurrent ?? OutputDeviceCatalog.currentDefault()
         device = current
         if let current { installActiveDeviceListeners(for: current.id) }
 
@@ -668,7 +691,8 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
                 uiHandlesMediaKeys = false
             }
         }
-        let trusted = MediaKeyTap.isAccessibilityTrusted
+        let trusted = cachedAccessibilityTrusted || MediaKeyTap.isAccessibilityTrusted
+        cachedAccessibilityTrusted = trusted
         if trusted && !mediaKeyTap.isRunning {
             _ = mediaKeyTap.start()
         }
@@ -701,17 +725,22 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
     }
 
     private func scheduleRetry(after delay: TimeInterval) {
+        retryWorkItem?.cancel()
         retryAfter = ProcessInfo.processInfo.systemUptime + delay
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+        let work = DispatchWorkItem { [weak self] in
+            self?.retryWorkItem = nil
             self?.evaluateRoute()
             self?.publishState(writeDisk: false)
         }
+        retryWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     private func updateAccessibilityPolling() {
         accessibilityPollTimer?.invalidate()
         accessibilityPollTimer = nil
-        guard !MediaKeyTap.isAccessibilityTrusted else { return }
+        cachedAccessibilityTrusted = MediaKeyTap.isAccessibilityTrusted
+        guard !cachedAccessibilityTrusted else { return }
         let timer = Timer(timeInterval: 1.5, target: self, selector: #selector(onAccessibilityPoll), userInfo: nil, repeats: true)
         timer.tolerance = 0.5
         RunLoop.main.add(timer, forMode: .common)
@@ -744,7 +773,9 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
     }
 
     @objc private func onAccessibilityPoll() {
-        guard MediaKeyTap.isAccessibilityTrusted else { return }
+        let trusted = MediaKeyTap.isAccessibilityTrusted
+        guard trusted else { return }
+        cachedAccessibilityTrusted = true
         accessibilityPollTimer?.invalidate()
         accessibilityPollTimer = nil
         syncMediaKeyIntercept()
@@ -752,7 +783,7 @@ private final class VolumeEngine: NSObject, NSApplicationDelegate {
     }
 
     private func publishState(writeDisk: Bool) {
-        let trusted = MediaKeyTap.isAccessibilityTrusted
+        let trusted = cachedAccessibilityTrusted
         let state = VolumeState(
             enginePID: getpid(),
             phase: phase,
