@@ -13,8 +13,14 @@ scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT
 
 sdk="$(xcrun --sdk macosx --show-sdk-path)"
+sdk_version="$(xcrun --sdk macosx --show-sdk-version)"
+sdk_major="${sdk_version%%.*}"
 arch="$(uname -m)"
 target="${arch}-apple-macosx14.4"
+swift_sdk_flags=()
+if [[ "${sdk_major:-0}" -ge 26 ]]; then
+  swift_sdk_flags+=(-D LIQUID_GLASS_SDK)
+fi
 cache_dir="$ROOT_DIR/build/.cache"
 mkdir -p "$cache_dir"
 
@@ -70,7 +76,7 @@ xcrun --sdk macosx swiftc -sdk "$sdk" -target "$target" -O -warnings-as-errors \
   -o "$scratch/RunTests" &
 pid_tests=$!
 
-xcrun --sdk macosx swiftc -sdk "$sdk" -target "$target" -O -warnings-as-errors \
+xcrun --sdk macosx swiftc -sdk "$sdk" -target "$target" -O -warnings-as-errors "${swift_sdk_flags[@]}" \
   -import-objc-header Sources/Engine/AudioGain.h \
   Sources/Shared/Localization.swift \
   Sources/Shared/AudioDevice.swift \
@@ -86,7 +92,7 @@ xcrun --sdk macosx swiftc -sdk "$sdk" -target "$target" -O -warnings-as-errors \
   -o "$engine_bundle/Contents/MacOS/DisplayVolumeEngine" &
 pid_engine=$!
 
-xcrun --sdk macosx swiftc -sdk "$sdk" -target "$target" -O -warnings-as-errors \
+xcrun --sdk macosx swiftc -sdk "$sdk" -target "$target" -O -warnings-as-errors "${swift_sdk_flags[@]}" \
   Sources/Shared/Localization.swift \
   Sources/Shared/AudioDevice.swift \
   Sources/Shared/VolumeModel.swift \

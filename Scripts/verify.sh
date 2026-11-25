@@ -86,11 +86,17 @@ if "isRunningSomewhere" not in engine:
 if "cachedAccessibilityTrusted" not in engine:
     errors.append("VolumeEngine.swift must cache Accessibility trust instead of calling AXIsProcessTrusted() on every drag tick")
 
+# Guard Liquid Glass SDK compile-time portability (macOS 15 Xcode 16 vs macOS 26+ SDK)
+for f in ("Sources/Engine/VolumeOSD.swift", "Sources/App/VolumeComponents.swift"):
+    src = (root / f).read_text()
+    if (".glassEffect(" in src or ".buttonStyle(.glass)" in src) and "#if LIQUID_GLASS_SDK" not in src:
+        errors.append(f"{f} uses macOS 26 Liquid Glass API without #if LIQUID_GLASS_SDK compile-time guard")
+
 if errors:
     for e in errors:
         print(f"FAIL: {e}", file=sys.stderr)
     sys.exit(1)
-print("OK: All 8 first-principles static anti-pattern guards passed")
+print("OK: All 9 first-principles static anti-pattern guards passed")
 PY
 
 echo "=== 3. Parallel Build, Unit Tests, Codesign & App Self-Test ==="

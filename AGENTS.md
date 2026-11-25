@@ -40,7 +40,7 @@ These rules codify the first-principles invariants learned from building and deb
 
 - **Zero mic privacy dot & zero AirPods HFP downgrade**: Microphone volume, mute, and device switching MUST use CoreAudio HAL properties only (`kAudioDevicePropertyVolumeScalar`, `kAudioDevicePropertyMute`, `kAudioHardwarePropertyDefaultInputDevice`). Never open an audio input capture stream (`AVAudioEngine`, `AVCaptureSession`, `AudioQueueNewInput`).
 - **Honest hardware capability reporting**: Always probe writable HAL properties at runtime. For auto-gain-only mics (e.g. Continuity iPhone microphone), display "Auto Gain" honestly instead of rendering a fake slider or fake mute button.
-- **SDK safety**: Build with `-warnings-as-errors` (Swift) and `-Wall -Wextra -Werror` (C17). Never use deprecated macOS 13 constants like `kAudioDeviceTransportTypeContinuityCapture` (use `Wired` / `Wireless`).
+- **SDK safety**: Build with `-warnings-as-errors` (Swift) and `-Wall -Wextra -Werror` (C17). Never use deprecated macOS 13 constants like `kAudioDeviceTransportTypeContinuityCapture` (use `Wired` / `Wireless`). Wrap macOS 26 Liquid Glass APIs (`.glassEffect`, `.buttonStyle(.glass)`) with `#if LIQUID_GLASS_SDK` (set automatically by `Scripts/build.sh` when SDK >= 26) so contributors and CI on macOS 15 / Xcode 16 compile cleanly.
 - **Liquid Glass OSD (`VolumeOSD.swift`)**: Keep a transparent `shadowInset >= 24`, `container.wantsLayer = false`, and `panel.hasShadow = false` so macOS window bounds never clip soft glass shadows into rectangular dark artifacts.
 - **Native monochrome alignment**: Default to macOS native controls, `NSPopover`, and neutral monochrome styling; keep primary controls directly visible without extra disclosure clicks.
 

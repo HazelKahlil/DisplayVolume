@@ -131,6 +131,7 @@ struct GlassCapsuleButton<Label: View>: View {
     }
 
     var body: some View {
+        #if LIQUID_GLASS_SDK
         if #available(macOS 26.0, *) {
             Button(action: action, label: label)
                 .buttonStyle(.glass)
@@ -140,17 +141,24 @@ struct GlassCapsuleButton<Label: View>: View {
                 .fontWeight(selected ? .semibold : .regular)
                 .disabled(disabled)
         } else {
-            Button(action: action) {
-                label()
-                    .padding(.horizontal, 10)
-                    .frame(height: 24)
-                    .background(selected ? Color.primary.opacity(0.16) : Color.primary.opacity(0.065), in: Capsule())
-                    .foregroundStyle(Color.primary)
-            }
-            .buttonStyle(.plain)
-            .focusEffectDisabled()
-            .disabled(disabled)
+            fallbackButton
         }
+        #else
+        fallbackButton
+        #endif
+    }
+
+    private var fallbackButton: some View {
+        Button(action: action) {
+            label()
+                .padding(.horizontal, 10)
+                .frame(height: 24)
+                .background(selected ? Color.primary.opacity(0.16) : Color.primary.opacity(0.065), in: Capsule())
+                .foregroundStyle(Color.primary)
+        }
+        .buttonStyle(.plain)
+        .focusEffectDisabled()
+        .disabled(disabled)
     }
 }
 
@@ -173,6 +181,7 @@ struct GlassCircleButton<Label: View>: View {
     }
 
     var body: some View {
+        #if LIQUID_GLASS_SDK
         if #available(macOS 26.0, *) {
             Button(action: action, label: label)
                 .buttonStyle(.glass)
@@ -181,15 +190,22 @@ struct GlassCircleButton<Label: View>: View {
                 .tint(active ? Color.primary.opacity(0.24) : nil)
                 .help(helpText)
         } else {
-            Button(action: action) {
-                label()
-                    .frame(width: 26, height: 26)
-                    .background(active ? Color.primary.opacity(0.18) : Color.primary.opacity(0.075), in: Circle())
-                    .foregroundStyle(Color.primary)
-            }
-            .buttonStyle(.plain)
-            .focusEffectDisabled()
-            .help(helpText)
+            fallbackButton
         }
+        #else
+        fallbackButton
+        #endif
+    }
+
+    private var fallbackButton: some View {
+        Button(action: action) {
+            label()
+                .frame(width: 26, height: 26)
+                .background(active ? Color.primary.opacity(0.18) : Color.primary.opacity(0.075), in: Circle())
+                .foregroundStyle(Color.primary)
+        }
+        .buttonStyle(.plain)
+        .focusEffectDisabled()
+        .help(helpText)
     }
 }
